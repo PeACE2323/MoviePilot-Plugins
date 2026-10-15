@@ -70,7 +70,7 @@ Media Automator 的日志由 `app/core/logging.py` 中的 `CustomJsonFormatter` 
    `/api/token`、`/api/system/token`。
 
 若全部失败，插件会在错误信息里列出尝试过的路径。此时用浏览器 F12 抓一次登录请求
-（Network 面板 → 点登录 → 看 POSC 请求的 URL 路径），把路径填进「登录接口路径」即可。
+（Network 面板 → 点登录 → 看 POST 请求的 URL 路径），把路径填进「登录接口路径」即可。
 
 **Token 说明**：登录得到的 Token 缓存在内存里跨轮询复用，不会每次都登录；遇到
 401/403 会清掉 Token 自动重新登录并重试一次。也可以直接在配置里填一个现成 Token

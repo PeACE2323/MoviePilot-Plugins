@@ -20,7 +20,7 @@ environment:
   - PLUGIN_MARKET=jxxghp/MoviePilot-Plugins,PeACE2323/MoviePilot-Plugins
 ```
 
-重启 MovicPilot 后，在「插件」页面即可搜索并安装。
+重启 MoviePilot 后，在「插件」页面即可搜索并安装。
 
 ## 目录说明
 
