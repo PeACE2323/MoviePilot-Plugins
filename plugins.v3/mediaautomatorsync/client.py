@@ -72,6 +72,8 @@ class MediaAutomatorClient:
         self.verify_ssl = verify_ssl
         # 自动探测到的登录路径会缓存在实例上，避免每次轮询重复探测。
         self._resolved_login_path: str = ""
+        # 登录后由 Set-Cookie 下发的会话凭证（下载接口只认它，不认 Authorization 头）。
+        self._cookies: Dict[str, str] = {}
         # 记录最近一次错误，便于在插件详情页与 API 中展示。
         self.last_error: str = ""
 
@@ -106,12 +108,14 @@ class MediaAutomatorClient:
             self.last_error = ""
             return text
 
-        # 401/403 时 Token 可能已过期：清掉并重新登录一次再试。
+        # 401/403 时凭证可能已过期：清掉 Token 与旧 cookie 后重新登录再试。
+        # 旧 cookie 必须一并清除——它才是下载接口实际校验的凭证，留着会让重试继续失败。
         if self._last_status in (401, 403):
-            logger.info("Media Automator 远程日志：Token 可能已过期，尝试重新登录")
+            logger.info("Media Automator 远程日志：凭证可能已过期，尝试重新登录")
             self.token = ""
+            self._cookies = {}
             self._resolved_login_path = ""
-            if await self._ensure_token():
+            if await self._ensure_token(force=True):
                 text = await self._request_text(url, with_token=True)
                 if text is not None:
                     self.last_error = ""
@@ -201,20 +205,29 @@ class MediaAutomatorClient:
         return candidates
 
     async def _try_login(self, path: str) -> Optional[str]:
-        """对给定路径尝试登录，成功时返回 Token。"""
+        """
+        对给定路径尝试登录，成功时返回 Token。
+
+        表单优先：Media Automator 是 FastAPI 应用，其 ``/auth/token`` 用的是
+        OAuth2PasswordRequestForm，要求 ``application/x-www-form-urlencoded``，
+        发 JSON 会被判为参数缺失。JSON 只作为兼容其它实现的兜底。
+        """
         url = urljoin(f"{self.base_url}/", path.lstrip("/"))
-        payload = {}
-        # 字段名可能不同，逐组尝试；Media Automator 常见的是 username/password。
+
+        payload = {"username": self.username, "password": self.password}
+        data = await self._request_json(url, method="POST", form_body=payload)
+        token = self._extract_token(data)
+        if token:
+            return token
+
+        # 兼容使用非标准字段名或 JSON 体的实现。
         for user_field, pass_field in zip(USERNAME_FIELDS, PASSWORD_FIELDS):
             payload = {user_field: self.username, pass_field: self.password}
             data = await self._request_json(url, method="POST", json_body=payload)
             token = self._extract_token(data)
             if token:
                 return token
-        # 部分实现用表单而非 JSON。
-        payload = {"username": self.username, "password": self.password}
-        data = await self._request_json(url, method="POST", form_body=payload)
-        return self._extract_token(data)
+        return None
 
     @staticmethod
     def _extract_token(data: Any) -> Optional[str]:
@@ -250,11 +263,60 @@ class MediaAutomatorClient:
     _last_status: int = 0
 
     def _headers(self, with_token: bool) -> Dict[str, str]:
-        """构造请求头。"""
+        """
+        构造请求头。
+
+        Media Automator 的下载接口**认 Cookie 而不认 Authorization 头**：登录后它用
+        ``Set-Cookie: ma_<hash>="Bearer <token>"`` 下发凭证，其中 ``<hash>`` 是动态生成
+        的，因此不能写死 cookie 名，只能把登录响应里的 Set-Cookie 原样保存再回传。
+
+        这里同时带上 Authorization 头，兼容可能存在的其它鉴权路径——多带一个头不会
+        影响只读 Cookie 的实现。
+        """
         headers = {"Accept": "*/*"}
         if with_token and self.token:
             headers["Authorization"] = f"Bearer {self.token}"
+            headers["Cookie"] = self._cookie_header()
         return headers
+
+    def _cookie_header(self) -> str:
+        """把保存的 cookie 拼成请求头值。"""
+        if not self._cookies:
+            return ""
+        return "; ".join(f"{name}={value}" for name, value in self._cookies.items())
+
+    def _store_cookies(self, response: Any) -> None:
+        """
+        从响应里收集 Set-Cookie。
+
+        登录接口返回的凭证就在 Set-Cookie 中；同时把服务端后续可能更新的 cookie 一并
+        吸收，保证会话始终是最新的。
+        """
+        try:
+            raw = response.headers.get_list("set-cookie")
+        except Exception:
+            # 某些响应实现只提供 get()，退化为单值读取。
+            single = None
+            try:
+                single = response.headers.get("set-cookie")
+            except Exception:
+                single = None
+            raw = [single] if single else []
+
+        for item in raw:
+            if not item:
+                continue
+            # 只取 "name=value" 部分，忽略 Path/HttpOnly/SameSite 等属性。
+            pair = item.split(";", 1)[0].strip()
+            if "=" not in pair:
+                continue
+            name, _, value = pair.partition("=")
+            name = name.strip()
+            if not name:
+                continue
+            self._cookies[name] = value.strip()
+        if raw:
+            logger.debug(f"Media Automator 远程日志：已更新 cookie {list(self._cookies)}")
 
     @staticmethod
     def _http() -> Any:
@@ -285,6 +347,9 @@ class MediaAutomatorClient:
             self._last_status = 0
             self.last_error = "请求失败（无响应，可能是地址错误、超时或无法连通）"
             return None
+
+        # 会话 cookie 可能在任意响应里刷新，统一收集。
+        self._store_cookies(response)
 
         self._last_status = response.status_code
         if response.status_code != 200:
@@ -325,6 +390,8 @@ class MediaAutomatorClient:
         if response is None:
             self._last_status = 0
             return None
+        # 登录响应里的 Set-Cookie 才是下载接口认可的凭证，必须在此收集。
+        self._store_cookies(response)
         self._last_status = response.status_code
         if response.status_code != 200:
             return None
