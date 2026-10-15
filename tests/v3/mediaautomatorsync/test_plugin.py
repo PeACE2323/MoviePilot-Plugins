@@ -213,14 +213,30 @@ def _install_stubs() -> None:
         rows = []
         deleted = []
 
+        @staticmethod
+        def _norm_source(value):
+            """
+            与宿主一致地规范化媒体来源。
+
+            真实 SubscribeOper 的 _lookup_values 会把枚举取出 value 再用作查询参数；
+            这里必须照做，否则测试用 str(枚举) 得到 'MediaSource.TMDB' 而永远无法命中，
+            会掩盖插件里来源传递的错误。
+            """
+            if value is None:
+                return None
+            return getattr(value, "value", value)
+
         def exists(self, media_source=None, media_id=None, **kwargs):
-            return (str(media_source), str(media_id)) in SubscribeOper.existing
+            key = (self._norm_source(media_source), str(media_id))
+            return key in SubscribeOper.existing
 
         def list_by_media_identity(self, media_source=None, media_id=None, **kwargs):
+            want_source = self._norm_source(media_source)
+            want_id = str(media_id)
             return [
                 r for r in SubscribeOper.rows
-                if str(getattr(r, "media_source", "")) == str(media_source)
-                and str(getattr(r, "media_id", "")) == str(media_id)
+                if self._norm_source(getattr(r, "media_source", None)) == want_source
+                and str(getattr(r, "media_id", "")) == want_id
             ]
 
         def list(self, state=None):
@@ -1132,3 +1148,167 @@ def test_remote_retries_after_401():
 
     assert result["added"] == 1, result
     assert state["count"] == 2, "应在 401 后重试一次"
+
+
+# --------------------------------------------------------------------------
+# 查缺补漏（全量订阅比对）
+# --------------------------------------------------------------------------
+
+# 取自实测的 /api/subscriptions 响应结构（精简）。
+SUBSCRIPTIONS_PAYLOAD = {
+    "tv": {
+        "items": [
+            {"id": 37, "tmdb_id": 294446, "media_type": "tv", "title": "美人余", "year": "2026"},
+            {"id": 14, "tmdb_id": 45790, "media_type": "tv", "title": "JOJO的奇妙冒险", "year": "2012"},
+        ],
+        "total_items": 2,
+    },
+    "movie": {
+        "items": [
+            {"id": 25, "tmdb_id": 1368337, "media_type": "movie", "title": "奥德赛", "year": "2026"},
+        ],
+        "total_items": 1,
+    },
+    "collection": {"items": [], "total_items": 0},
+}
+
+
+def test_client_fetch_subscriptions_flattens_groups():
+    """订阅清单应把 tv/movie/collection 三组拍平成统一记录。"""
+    _reset_routes()
+    FakeAsyncRequestUtils.routes = {
+        "/auth/token": FakeResponse(200, "", {"access_token": "t"}),
+        "/api/subscriptions": FakeResponse(200, "", SUBSCRIPTIONS_PAYLOAD),
+    }
+    import asyncio
+
+    client = MediaAutomatorClient(base_url=BASE, username="root", password="secret", login_path="/auth/token")
+    records = asyncio.run(client.fetch_subscriptions())
+    assert records is not None
+    assert len(records) == 3
+    by_id = {r["tmdb_id"]: r for r in records}
+    assert by_id["294446"]["title"] == "美人余"
+    assert by_id["294446"]["media_type"] == "tv"
+    assert by_id["1368337"]["media_type"] == "movie"
+    # 空分组不应产生记录
+    assert "collection" not in {r["group"] for r in records}
+
+
+def test_client_fetch_subscriptions_skips_incomplete():
+    """缺少 tmdb_id 或标题的条目应被跳过，而不是让整份清单失败。"""
+    _reset_routes()
+    FakeAsyncRequestUtils.routes = {
+        "/auth/token": FakeResponse(200, "", {"access_token": "t"}),
+        "/api/subscriptions": FakeResponse(
+            200,
+            "",
+            {
+                "tv": {
+                    "items": [
+                        {"id": 1, "tmdb_id": None, "title": "无ID"},
+                        {"id": 2, "tmdb_id": 123, "title": None},
+                        {"id": 3, "tmdb_id": 456, "title": "正常", "year": "2024"},
+                    ]
+                },
+                "movie": {"items": []},
+            },
+        ),
+    }
+    import asyncio
+
+    client = MediaAutomatorClient(base_url=BASE, username="root", password="secret", login_path="/auth/token")
+    records = asyncio.run(client.fetch_subscriptions())
+    assert records is not None
+    assert [r["tmdb_id"] for r in records] == ["456"]
+
+
+def test_reconcile_adds_only_missing():
+    """查缺补漏只补 MP 缺的，已有的不重复添加。"""
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    # MP 已有 JOJO（45790），缺美人余（294446）和奥德赛（1368337）
+    SubscribeOper.existing = {("themoviedb", "45790")}
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "新增订阅成功")
+
+    FakeAsyncRequestUtils.routes = {
+        "/auth/token": FakeResponse(200, "", {"access_token": "t"}),
+        "/api/subscriptions": FakeResponse(200, "", SUBSCRIPTIONS_PAYLOAD),
+    }
+
+    instance = _http_plugin(ma_login_path="/auth/token")
+    result = instance.api_reconcile()
+
+    assert result["success"] is True, result
+    assert "MA 共 3 条" in result["message"]
+    assert "已有 1 条" in result["message"]
+    # 只应提交缺失的两条
+    added_ids = sorted(c["media_id"] for c in SubscribeChain.add_calls)
+    assert added_ids == ["1368337", "294446"], added_ids
+
+
+def test_reconcile_dry_run_does_not_write():
+    """dry_run 只列出待补条目，不实际写入订阅。"""
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.existing = set()
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    FakeAsyncRequestUtils.routes = {
+        "/auth/token": FakeResponse(200, "", {"access_token": "t"}),
+        "/api/subscriptions": FakeResponse(200, "", SUBSCRIPTIONS_PAYLOAD),
+    }
+    instance = _http_plugin(ma_login_path="/auth/token")
+    result = instance.api_reconcile(dry_run=True)
+
+    assert result["success"] is True
+    assert "待补 3 条" in result["message"]
+    assert SubscribeChain.add_calls == [], "dry_run 不应写入订阅"
+    assert len(result["data"]) == 3
+
+
+def test_reconcile_respects_limit():
+    """limit 限制单次补订数量。"""
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.existing = set()
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    FakeAsyncRequestUtils.routes = {
+        "/auth/token": FakeResponse(200, "", {"access_token": "t"}),
+        "/api/subscriptions": FakeResponse(200, "", SUBSCRIPTIONS_PAYLOAD),
+    }
+    instance = _http_plugin(ma_login_path="/auth/token")
+    result = instance.api_reconcile(limit=1)
+
+    assert result["success"] is True
+    assert len(SubscribeChain.add_calls) == 1, SubscribeChain.add_calls
+
+
+def test_reconcile_requires_http_mode():
+    """文件模式没有订阅清单接口，应给出明确提示。"""
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_source": "file", "log_path": "x.log"})
+    result = instance.api_reconcile()
+    assert result["success"] is False
+    assert "远程 HTTP" in result["message"]
+
+
+def test_reconcile_reports_error_when_unreachable():
+    """拉取订阅清单失败时应返回失败而不是抛异常。"""
+    _reset_routes()
+    instance = _http_plugin(ma_login_path="/auth/token")
+    result = instance.api_reconcile()
+    assert result["success"] is False
+    assert result["message"]

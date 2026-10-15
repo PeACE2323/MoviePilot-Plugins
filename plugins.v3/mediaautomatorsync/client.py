@@ -35,6 +35,9 @@ LOGIN_PATH_CANDIDATES = (
 # 已确认存在的日志下载端点。
 LOG_DOWNLOAD_PATH = "/api/system/logs/download"
 
+# 全量订阅清单端点（返回 {tv:{items:[]}, movie:{items:[]}, collection:{items:[]}}）。
+SUBSCRIPTIONS_PATH = "/api/subscriptions"
+
 # 登录请求里可能使用的用户名字段名，按顺序尝试。
 USERNAME_FIELDS = ("username", "user", "account")
 # 登录请求里可能使用的密码字段名。
@@ -144,6 +147,67 @@ class MediaAutomatorClient:
                 return False, f"登录成功，但读取日志失败：{self.last_error}"
             return True, f"连接成功，日志约 {len(text)} 字符"
         return False, self.last_error or "登录失败"
+
+    async def fetch_subscriptions(self) -> Optional[List[Dict[str, Any]]]:
+        """
+        拉取 Media Automator 的**全量订阅清单**。
+
+        日志只记录「变更事件」，拿不到「当前有哪些订阅」；查缺补漏必须靠这个接口。
+        响应形如 ``{"tv": {"items": [...]}, "movie": {"items": [...]}, "collection": {...}}``，
+        这里把三组拍平成统一的记录列表。
+
+        :return: 订阅记录列表；失败返回 None 并设置 ``last_error``
+        """
+        if not self.available():
+            self.last_error = "未配置服务地址，或既未提供 Token 也未提供账号密码"
+            return None
+        if not self.token and not await self._ensure_token():
+            return None
+
+        url = urljoin(f"{self.base_url}/", SUBSCRIPTIONS_PATH.lstrip("/"))
+        data = await self._request_json(url, with_token=True)
+
+        # 401/403 时凭证可能已过期：清掉后重新登录一次再试。
+        if data is None and self._last_status in (401, 403):
+            logger.info("Media Automator 订阅清单：凭证可能已过期，尝试重新登录")
+            self.token = ""
+            self._cookies = {}
+            self._resolved_login_path = ""
+            if await self._ensure_token(force=True):
+                data = await self._request_json(url, with_token=True)
+
+        if not isinstance(data, dict):
+            if not self.last_error:
+                self.last_error = f"订阅清单响应格式异常（HTTP {self._last_status or '未知'}）"
+            return None
+
+        records: List[Dict[str, Any]] = []
+        for group in ("tv", "movie", "collection"):
+            section = data.get(group)
+            items = section.get("items") if isinstance(section, dict) else None
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                tmdb_id = item.get("tmdb_id")
+                title = item.get("title")
+                if not tmdb_id or not title:
+                    # 没有 TMDB 身份或标题的条目无法在 MoviePilot 侧识别，跳过。
+                    continue
+                records.append(
+                    {
+                        "tmdb_id": str(tmdb_id),
+                        "title": str(title),
+                        "year": str(item.get("year") or ""),
+                        "media_type": str(item.get("media_type") or group),
+                        "group": group,
+                        "status": item.get("status"),
+                        "ma_id": item.get("id"),
+                    }
+                )
+        self.last_error = ""
+        return records
 
     # ------------------------------------------------------------------
     # 登录
@@ -363,22 +427,27 @@ class MediaAutomatorClient:
         method: str = "GET",
         json_body: Optional[dict] = None,
         form_body: Optional[dict] = None,
+        with_token: bool = False,
     ) -> Optional[Any]:
         """发起 GET/POST 并返回解析后的 JSON。"""
+        # 登录请求本身不能带旧凭证；其余业务接口需要带上 token 与 cookie。
+        headers = {"Accept": "application/json"}
+        if with_token:
+            headers.update(self._headers(with_token=True))
         try:
             if method == "POST":
                 response = await self._http().post_res(
                     url=url,
                     json=json_body,
                     data=form_body,
-                    headers={"Accept": "application/json"},
+                    headers=headers,
                     timeout=self.timeout,
                     verify=self.verify_ssl,
                 )
             else:
                 response = await self._http().get_res(
                     url=url,
-                    headers={"Accept": "application/json"},
+                    headers=headers,
                     timeout=self.timeout,
                     verify=self.verify_ssl,
                 )

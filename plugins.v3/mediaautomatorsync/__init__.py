@@ -97,7 +97,7 @@ class MediaAutomatorSync(_PluginBase):
     # 插件图标
     plugin_icon = "MediaAutomator_A.png"
     # 插件版本
-    plugin_version = "1.1.1"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "PeACE2323"
     # 作者主页
@@ -242,6 +242,13 @@ class MediaAutomatorSync(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "测试日志来源连通性",
+            },
+            {
+                "path": "/reconcile",
+                "endpoint": self.api_reconcile,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "查缺补漏：补齐 MoviePilot 缺少的订阅",
             },
             {
                 "path": "/probe",
@@ -863,6 +870,92 @@ class MediaAutomatorSync(_PluginBase):
                 }
             )
         return {"success": True, "message": f"已解析 {len(parsed)} 行", "data": parsed}
+
+    def api_reconcile(self, limit: int = 0, dry_run: bool = False) -> dict:
+        """
+        手动执行一次「查缺补漏」：把 Media Automator 的全部订阅与 MoviePilot 比对，
+        只补齐 MoviePilot 缺少的那些。
+
+        :param limit: 单次最多补几条；0 表示不限制
+        :param dry_run: 为真时只列出将要补的条目，不实际写入
+        :return: 统计结果
+        """
+        if self._log_source != LOG_SOURCE_HTTP:
+            return {
+                "success": False,
+                "message": "查缺补漏需要「远程 HTTP」日志来源（要调用订阅清单接口）",
+            }
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+
+        limit = self._parse_non_negative_int(limit, 0)
+        client = self.__get_client()
+        records = self.__run_async(client.fetch_subscriptions())
+        if records is None:
+            self._last_error = client.last_error or "拉取订阅清单失败"
+            return {"success": False, "message": self._last_error, "data": []}
+
+        existing = 0
+        added = 0
+        failed = 0
+        planned: List[Dict[str, Any]] = []
+        details: List[Dict[str, Any]] = []
+
+        for item in records:
+            tmdb_id = item["tmdb_id"]
+            # 先按 TMDB 身份判断 MoviePilot 是否已有，避免重复添加。
+            try:
+                if SubscribeOper().exists(media_source=MediaSource.TMDB, media_id=tmdb_id):
+                    existing += 1
+                    continue
+            except Exception as error:
+                logger.warning(f"Media Automator 查缺补漏：查询既有订阅失败：{error}")
+
+            if limit and added + len(planned) >= limit:
+                # 达到本次上限，剩余条目留给下次。
+                break
+
+            if dry_run:
+                planned.append(item)
+                continue
+
+            media = {
+                "title": item["title"],
+                "year": item["year"],
+                "media_id": tmdb_id,
+                "media_source": MediaSource.TMDB.value,
+                "raw_type": item["media_type"],
+            }
+            try:
+                outcome = self.__apply_add(media, {})
+            except Exception as error:  # 单条失败不影响其余条目
+                logger.error(
+                    f"Media Automator 查缺补漏：补订「{item['title']}」失败：{error}",
+                    exc_info=True,
+                )
+                failed += 1
+                details.append({**item, "result": f"失败：{error}"})
+                continue
+            if outcome.get("changed"):
+                added += 1
+                self.__record_history("add", media, f"查缺补漏：{outcome.get('message')}")
+            else:
+                existing += 1
+            details.append({**item, "result": outcome.get("message")})
+
+        summary = (
+            f"MA 共 {len(records)} 条订阅，MP 已有 {existing} 条，"
+            f"{'待补' if dry_run else '新补'} {len(planned) if dry_run else added} 条，"
+            f"失败 {failed} 条"
+        )
+        logger.info(f"Media Automator 查缺补漏完成：{summary}")
+        if not dry_run and (added or failed):
+            self.__notify_reconcile(summary)
+        return {
+            "success": True,
+            "message": summary,
+            "data": planned if dry_run else details,
+        }
 
     def api_reset(self) -> dict:
         """清空读取位置、远程行指纹与同步历史。"""
@@ -1621,6 +1714,28 @@ class MediaAutomatorSync(_PluginBase):
                 "history_limit": self._history_limit,
             }
         )
+
+    @staticmethod
+    def _parse_non_negative_int(value: Any, fallback: int) -> int:
+        """把配置值解析为非负整数，非法时返回默认值（0 合法，表示不限制）。"""
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return fallback
+        return parsed if parsed >= 0 else fallback
+
+    def __notify_reconcile(self, summary: str) -> None:
+        """发送查缺补漏结果通知。"""
+        from app.schemas.types import MessageType
+
+        try:
+            self.post_message(
+                mtype=MessageType.Plugin,
+                title="Media Automator 查缺补漏",
+                text=summary,
+            )
+        except Exception as error:
+            logger.error(f"Media Automator 查缺补漏：发送通知失败：{error}")
 
     @staticmethod
     def _parse_positive_int(value: Any, fallback: int) -> int:
