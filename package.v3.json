@@ -1,0 +1,18 @@
+{
+  "MediaAutomatorSync": {
+    "name": "Media Automator 订阅同步",
+    "description": "读取 Media Automator 日志，检测到新增或删除订阅时自动在 MoviePilot 上做同样的操作。支持远程HTTP（填地址与账号密码，无需挂载）或本地文件两种日志来源。",
+    "labels": "订阅,同步",
+    "version": "1.1.0",
+    "icon": "MediaAutomator_A.png",
+    "author": "PeACE2323",
+    "project_url": "https://github.com/PeACE2323/MoviePilot-Plugins",
+    "level": 1,
+    "release": true,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.1.0": "新增远程 HTTP 日志来源：填写 Media Automator 地址与账号密码即可自动登录并拉取日志，无需挂载目录；登录接口支持从 openapi.json 自动探测，Token 可缓存复用并在 401 时自动重登重试；远程模式用行指纹做增量去重，日志轮转自动降级为按最近行处理；新增 /test 连通性检测接口。",
+      "v1.0.0": "首个版本：增量读取 Media Automator 的 JSON 行日志，按 event_type 与可配置正则识别订阅新增/删除，通过 SubscribeChain 与 SubscribeOper 单向镜像到 MoviePilot；支持日志轮转检测、处理历史、解析预览接口与通知。"
+    }
+  }
+}
