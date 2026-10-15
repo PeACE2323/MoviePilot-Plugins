@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from apscheduler.triggers.cron import CronTrigger
 
+from app import schemas
 from app.chain.media import MediaChain
 from app.chain.subscribe import SubscribeChain
 from app.db.oper.subscribe import SubscribeOper
@@ -97,7 +98,7 @@ class MediaAutomatorSync(_PluginBase):
     # 插件图标
     plugin_icon = "MediaAutomator_A.png"
     # 插件版本
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     # 插件作者
     plugin_author = "PeACE2323"
     # 作者主页
@@ -220,7 +221,13 @@ class MediaAutomatorSync(_PluginBase):
         ]
 
     def get_api(self) -> List[Dict[str, Any]]:
-        """注册插件 API，供前端手动触发与查看运行状态。"""
+        """
+        注册插件 API，供前端手动触发与查看运行状态。
+
+        详情页的按钮走宿主统一请求客户端，它按标准三段式 ``Response`` 解析响应；
+        因此这里显式声明 ``response_model``，端点也统一返回 ``schemas.Response``。
+        返回裸字典会让前端判定为「服务器返回了无效响应」。
+        """
         return [
             {
                 "path": "/run",
@@ -228,6 +235,7 @@ class MediaAutomatorSync(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "立即执行一次订阅同步",
+                "response_model": schemas.Response,
             },
             {
                 "path": "/status",
@@ -235,6 +243,7 @@ class MediaAutomatorSync(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "查询插件运行状态",
+                "response_model": schemas.Response,
             },
             {
                 "path": "/test",
@@ -242,6 +251,7 @@ class MediaAutomatorSync(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "测试日志来源连通性",
+                "response_model": schemas.Response,
             },
             {
                 "path": "/reconcile",
@@ -249,6 +259,7 @@ class MediaAutomatorSync(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "查缺补漏：补齐 MoviePilot 缺少的订阅",
+                "response_model": schemas.Response,
             },
             {
                 "path": "/probe",
@@ -256,6 +267,7 @@ class MediaAutomatorSync(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "预览日志解析结果",
+                "response_model": schemas.Response,
             },
             {
                 "path": "/reset",
@@ -263,6 +275,7 @@ class MediaAutomatorSync(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "清空读取位置与同步历史",
+                "response_model": schemas.Response,
             },
         ]
 
@@ -892,12 +905,17 @@ class MediaAutomatorSync(_PluginBase):
     # 插件 API
     # ------------------------------------------------------------------
 
-    def api_run(self) -> dict:
+    def api_run(self) -> schemas.Response:
         """立即执行一次同步并返回本次处理结果。"""
         result = self.sync()
-        return result
+        # sync() 返回的是普通统计字典，这里包装成宿主统一的响应 envelope。
+        return schemas.Response(
+            success=bool(result.get("success")),
+            message=str(result.get("message") or ""),
+            data=result,
+        )
 
-    def api_status(self) -> dict:
+    def api_status(self) -> schemas.Response:
         """返回插件当前运行状态。"""
         status = {
             "enabled": self._enabled,
@@ -925,9 +943,9 @@ class MediaAutomatorSync(_PluginBase):
                     "cursor": self._cursor,
                 }
             )
-        return status
+        return schemas.Response(success=True, message="", data=status)
 
-    def api_test(self) -> dict:
+    def api_test(self) -> schemas.Response:
         """
         测试与 Media Automator 的连通性与登录。
 
@@ -937,15 +955,15 @@ class MediaAutomatorSync(_PluginBase):
         if self._log_source != LOG_SOURCE_HTTP:
             path = Path(self._log_path) if self._log_path else None
             if not path or not path.exists():
-                return {"success": False, "message": f"日志文件不存在：{self._log_path}"}
+                return schemas.Response(success=False, message=f"日志文件不存在：{self._log_path}")
             try:
                 lines = self.__read_tail_lines(self._log_path, 1)
             except (OSError, ValueError) as error:
-                return {"success": False, "message": f"读取日志失败：{error}"}
-            return {
-                "success": True,
-                "message": f"日志文件可读，大小 {path.stat().st_size} 字节，末行可得 {len(lines)} 行",
-            }
+                return schemas.Response(success=False, message=f"读取日志失败：{error}")
+            return schemas.Response(
+                success=True,
+                message=f"日志文件可读，大小 {path.stat().st_size} 字节，末行可得 {len(lines)} 行",
+            )
 
         client = self.__get_client()
         ok, message = self.__run_async(client.login_only())
@@ -953,9 +971,9 @@ class MediaAutomatorSync(_PluginBase):
         if ok and client._resolved_login_path and not self._ma_login_path:
             self._ma_login_path = client._resolved_login_path
             self.__update_config()
-        return {"success": ok, "message": message}
+        return schemas.Response(success=ok, message=message)
 
-    def api_probe(self, limit: int = 50) -> dict:
+    def api_probe(self, limit: int = 50) -> schemas.Response:
         """预览日志解析结果，用于核对正则是否与用户的 Media Automator 版本匹配。"""
         limit = self._parse_positive_int(limit, 50)
 
@@ -964,19 +982,19 @@ class MediaAutomatorSync(_PluginBase):
             client = self.__get_client()
             text = self.__run_async(client.fetch_log())
             if text is None:
-                return {
-                    "success": False,
-                    "message": f"拉取远程日志失败：{client.last_error}",
-                    "data": [],
-                }
+                return schemas.Response(
+                    success=False,
+                    message=f"拉取远程日志失败：{client.last_error}",
+                    data=[],
+                )
             lines = [line for line in text.splitlines() if line.strip()][-limit:]
         else:
             try:
                 lines = self.__read_tail_lines(self._log_path, limit)
             except OSError as error:
-                return {"success": False, "message": f"读取日志失败：{error}", "data": []}
+                return schemas.Response(success=False, message=f"读取日志失败：{error}", data=[])
             except ValueError as error:
-                return {"success": False, "message": str(error), "data": []}
+                return schemas.Response(success=False, message=str(error), data=[])
 
         parsed: List[Dict[str, Any]] = []
         for raw in lines:
@@ -995,9 +1013,9 @@ class MediaAutomatorSync(_PluginBase):
                     "media": self.__extract_media(record) if action else None,
                 }
             )
-        return {"success": True, "message": f"已解析 {len(parsed)} 行", "data": parsed}
+        return schemas.Response(success=True, message=f"已解析 {len(parsed)} 行", data=parsed)
 
-    def api_reconcile(self, limit: int = 0, dry_run: bool = False) -> dict:
+    def api_reconcile(self, limit: int = 0, dry_run: bool = False) -> schemas.Response:
         """
         手动执行一次「查缺补漏」：把 Media Automator 的全部订阅与 MoviePilot 比对，
         只补齐 MoviePilot 缺少的那些。
@@ -1007,19 +1025,19 @@ class MediaAutomatorSync(_PluginBase):
         :return: 统计结果
         """
         if self._log_source != LOG_SOURCE_HTTP:
-            return {
-                "success": False,
-                "message": "查缺补漏需要「远程 HTTP」日志来源（要调用订阅清单接口）",
-            }
+            return schemas.Response(
+                success=False,
+                message="查缺补漏需要「远程 HTTP」日志来源（要调用订阅清单接口）",
+            )
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return schemas.Response(success=False, message="插件未启用")
 
         limit = self._parse_non_negative_int(limit, 0)
         client = self.__get_client()
         records = self.__run_async(client.fetch_subscriptions())
         if records is None:
             self._last_error = client.last_error or "拉取订阅清单失败"
-            return {"success": False, "message": self._last_error, "data": []}
+            return schemas.Response(success=False, message=self._last_error, data=[])
 
         existing = 0
         added = 0
@@ -1077,13 +1095,13 @@ class MediaAutomatorSync(_PluginBase):
         logger.info(f"Media Automator 查缺补漏完成：{summary}")
         if not dry_run and (added or failed):
             self.__notify_reconcile(summary)
-        return {
-            "success": True,
-            "message": summary,
-            "data": planned if dry_run else details,
-        }
+        return schemas.Response(
+            success=True,
+            message=summary,
+            data=planned if dry_run else details,
+        )
 
-    def api_reset(self) -> dict:
+    def api_reset(self) -> schemas.Response:
         """清空读取位置、远程行指纹与同步历史。"""
         with self._state_lock:
             self._cursor = {}
@@ -1091,7 +1109,7 @@ class MediaAutomatorSync(_PluginBase):
             self._history = []
             self._last_error = ""
             self.__persist_state()
-        return {"success": True, "message": "已清空读取位置与同步历史"}
+        return schemas.Response(success=True, message="已清空读取位置与同步历史")
 
     # ------------------------------------------------------------------
     # 核心同步逻辑

@@ -160,6 +160,24 @@ def _install_stubs() -> None:
     schemas = types.ModuleType("app.schemas")
     types_mod = types.ModuleType("app.schemas.types")
 
+    class Response:
+        """
+        与宿主一致的统一响应 envelope。
+
+        插件 API 走宿主统一客户端时必须是这个三段式结构；返回裸字典会被前端判为
+        「服务器返回了无效响应」。测试桩保留同名属性，插件里写错属性名会立即报错。
+        """
+
+        def __init__(self, success=False, message="", data=None):
+            self.success = success
+            self.message = message
+            self.data = data
+
+        def model_dump(self):
+            return {"success": self.success, "message": self.message, "data": self.data}
+
+    schemas.Response = Response
+
     class MediaType:
         MOVIE = "电影"
         TV = "电视剧"
@@ -1242,9 +1260,9 @@ def test_reconcile_adds_only_missing():
     instance = _http_plugin(ma_login_path="/auth/token")
     result = instance.api_reconcile()
 
-    assert result["success"] is True, result
-    assert "MA 共 3 条" in result["message"]
-    assert "已有 1 条" in result["message"]
+    assert result.success is True, result
+    assert "MA 共 3 条" in result.message
+    assert "已有 1 条" in result.message
     # 只应提交缺失的两条
     added_ids = sorted(c["media_id"] for c in SubscribeChain.add_calls)
     assert added_ids == ["1368337", "294446"], added_ids
@@ -1268,10 +1286,10 @@ def test_reconcile_dry_run_does_not_write():
     instance = _http_plugin(ma_login_path="/auth/token")
     result = instance.api_reconcile(dry_run=True)
 
-    assert result["success"] is True
-    assert "待补 3 条" in result["message"]
+    assert result.success is True
+    assert "待补 3 条" in result.message
     assert SubscribeChain.add_calls == [], "dry_run 不应写入订阅"
-    assert len(result["data"]) == 3
+    assert len(result.data) == 3
 
 
 def test_reconcile_respects_limit():
@@ -1292,7 +1310,7 @@ def test_reconcile_respects_limit():
     instance = _http_plugin(ma_login_path="/auth/token")
     result = instance.api_reconcile(limit=1)
 
-    assert result["success"] is True
+    assert result.success is True
     assert len(SubscribeChain.add_calls) == 1, SubscribeChain.add_calls
 
 
@@ -1301,8 +1319,8 @@ def test_reconcile_requires_http_mode():
     instance = MediaAutomatorSync()
     instance.init_plugin({"enabled": True, "log_source": "file", "log_path": "x.log"})
     result = instance.api_reconcile()
-    assert result["success"] is False
-    assert "远程 HTTP" in result["message"]
+    assert result.success is False
+    assert "远程 HTTP" in result.message
 
 
 def test_reconcile_reports_error_when_unreachable():
@@ -1310,8 +1328,8 @@ def test_reconcile_reports_error_when_unreachable():
     _reset_routes()
     instance = _http_plugin(ma_login_path="/auth/token")
     result = instance.api_reconcile()
-    assert result["success"] is False
-    assert result["message"]
+    assert result.success is False
+    assert result.message
 
 
 # --------------------------------------------------------------------------
@@ -1380,3 +1398,46 @@ def test_every_page_action_targets_a_registered_api():
             continue
         # 调用的 path 可能带 query，这里只比对路径部分
         assert api_path in declared, f"按钮「{btn.get('text')}」指向未声明的 API：{api_path}"
+
+
+def test_api_endpoints_declare_response_model():
+    """
+    每个 API 都必须声明 response_model。
+
+    详情页按钮走宿主统一客户端，它按标准三段式解析；不声明模型时前端会把响应
+    当成无效数据，表现为「服务器返回了无效响应」。
+    """
+    instance = _http_plugin()
+    for api in instance.get_api():
+        assert api.get("response_model") is not None, f"{api['path']} 缺少 response_model"
+
+
+def test_api_methods_return_response_envelope():
+    """
+    API 方法必须返回 schemas.Response，而不是裸字典。
+
+    裸字典在插件加载和单测里都看不出问题，只有真实点击按钮才会暴露。
+    """
+    from app.schemas import Response
+
+    _reset_routes()
+    instance = _http_plugin(ma_login_path="/auth/token")
+
+    # 不可达场景：应返回 Response 且 success 为 False
+    result = instance.api_reconcile()
+    assert isinstance(result, Response), type(result)
+    assert result.success is False
+
+    # 文件模式的 test 接口同样要返回 Response
+    file_instance = MediaAutomatorSync()
+    file_instance.init_plugin({"enabled": True, "log_source": "file", "log_path": "nope.log"})
+    assert isinstance(file_instance.api_test(), Response)
+    assert isinstance(file_instance.api_reset(), Response)
+    assert isinstance(file_instance.api_status(), Response)
+    assert isinstance(file_instance.api_run(), Response)
+
+    # 查缺补漏在文件模式下应明确拒绝，而不是抛异常
+    rejected = file_instance.api_reconcile()
+    assert isinstance(rejected, Response)
+    assert rejected.success is False
+    assert "远程 HTTP" in rejected.message
