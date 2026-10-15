@@ -101,13 +101,29 @@ def _install_stubs() -> None:
     # app.sdk.network.AsyncRequestUtils：可编程的假 HTTP 客户端。
     network_mod = types.ModuleType("app.sdk.network")
 
+    class FakeHeaders:
+        """最小响应头对象，模拟 httpx2 的 Headers（支持 get_list）。"""
+
+        def __init__(self, pairs=None):
+            self._pairs = list(pairs or [])
+
+        def get_list(self, name):
+            low = name.lower()
+            return [v for k, v in self._pairs if k.lower() == low]
+
+        def get(self, name, default=None):
+            values = self.get_list(name)
+            return values[-1] if values else default
+
     class FakeResponse:
         """最小响应对象，模拟 httpx2.Response 的接口。"""
 
-        def __init__(self, status_code=200, text="", payload=None):
+        def __init__(self, status_code=200, text="", payload=None, set_cookies=None):
             self.status_code = status_code
             self.text = text
             self._payload = payload
+            pairs = [("set-cookie", c) for c in (set_cookies or [])]
+            self.headers = FakeHeaders(pairs)
 
         def json(self):
             if self._payload is None:
@@ -138,6 +154,7 @@ def _install_stubs() -> None:
     network_mod.AsyncRequestUtils = AsyncRequestUtils
     # 供测试构造响应对象使用
     network_mod._FakeResponse = FakeResponse
+    network_mod._FakeHeaders = FakeHeaders
 
     # app.schemas.types
     schemas = types.ModuleType("app.schemas")
@@ -941,8 +958,140 @@ def test_remote_requires_credentials():
     assert "未配置" in result["message"] or "登录" in result["message"]
 
 
+def test_remote_sends_cookie_from_set_cookie():
+    """
+    Media Automator 的下载接口只认登录下发的 cookie，不认 Authorization 头。
+
+    这是线上实测得到的真实行为：登录响应形如
+        {"access_token": "eyJ...", "token_type": "bearer"}
+        Set-Cookie: ma_<hash>="Bearer eyJ..."; HttpOnly; Path=/
+    下载接口必须带上该 cookie 才能通过鉴权，因此这里断言 cookie 被保存并回传。
+    """
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.rows = []
+    SubscribeOper.existing = set()
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    cookie_name = "ma_285446e3"
+    cookie_value = '"Bearer eyJhbGciOiJIUzI1NiJ9.fake"'
+    FakeAsyncRequestUtils.routes = {
+        "/auth/token": FakeResponse(
+            200,
+            "",
+            {"access_token": "tok-abc", "token_type": "bearer"},
+            set_cookies=[f"{cookie_name}={cookie_value}; HttpOnly; Max-Age=604800; Path=/; SameSite=lax"],
+        ),
+        "/logs/download": FakeResponse(
+            200,
+            _log_text([{"timestamp": _ts(2), "message": "订阅成功", "context": {"tmdb_id": 3}}]),
+        ),
+    }
+
+    instance = _http_plugin(ma_login_path="/auth/token")
+    result = instance.sync()
+    assert result["added"] == 1, result
+
+    download_calls = [r for r in FakeAsyncRequestUtils.requests if "logs/download" in (r[1] or "")]
+    assert download_calls, "应请求日志下载端点"
+    sent_headers = download_calls[0][2] or {}
+    # 关键断言：带上从 Set-Cookie 收集到的会话 cookie
+    assert cookie_name in (sent_headers.get("Cookie") or ""), sent_headers
+    assert "Bearer" in (sent_headers.get("Cookie") or ""), sent_headers
+
+
+def test_remote_clears_stale_cookie_on_401():
+    """
+    401 后重试必须清除旧 cookie。
+
+    线上出现过「登录成功但一直 401」的循环：旧 cookie 未清除，重试仍带着失效凭证。
+    这里验证重新登录后会使用新 cookie。
+    """
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.rows = []
+    SubscribeOper.existing = set()
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    state = {"n": 0}
+    cookie_name = "ma_aaaa1111"
+
+    class _FlakyUtils(FakeAsyncRequestUtils):
+        async def get_res(self, url=None, headers=None, **kwargs):
+            FakeAsyncRequestUtils.requests.append(("GET", url, headers))
+            if "logs/download" in (url or ""):
+                state["n"] += 1
+                if state["n"] == 1:
+                    return FakeResponse(401, "")
+                # 第二次必须已经换成新 cookie
+                assert "fresh" in ((headers or {}).get("Cookie") or ""), headers
+                return FakeResponse(
+                    200,
+                    _log_text([{"timestamp": _ts(2), "message": "订阅成功", "context": {"tmdb_id": 8}}]),
+                )
+            return FakeResponse(404, "")
+
+        async def post_res(self, url=None, headers=None, json=None, data=None, **kwargs):
+            FakeAsyncRequestUtils.requests.append(("POST", url, json or data))
+            return FakeResponse(
+                200,
+                "",
+                {"access_token": "fresh-token"},
+                set_cookies=[f'{cookie_name}="Bearer fresh"; HttpOnly; Path=/'],
+            )
+
+    _network_mod.AsyncRequestUtils = _FlakyUtils
+    try:
+        instance = _http_plugin(ma_login_path="/auth/token")
+        result = instance.sync()
+    finally:
+        _network_mod.AsyncRequestUtils = FakeAsyncRequestUtils
+
+    assert result["added"] == 1, result
+    assert state["n"] == 2, "应在 401 后重试一次"
+
+
+def test_remote_login_uses_form_encoding():
+    """
+    登录必须用表单体而非 JSON。
+
+    Media Automator 的 /auth/token 是 FastAPI 的 OAuth2PasswordRequestForm，
+    发 JSON 会被判为缺少参数并返回 422。
+    """
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.rows = []
+    SubscribeOper.existing = set()
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    FakeAsyncRequestUtils.routes = {
+        "/auth/token": FakeResponse(200, "", {"access_token": "t"}),
+        "/logs/download": FakeResponse(
+            200, _log_text([{"timestamp": _ts(2), "message": "订阅成功", "context": {"tmdb_id": 4}}])
+        ),
+    }
+    instance = _http_plugin(ma_login_path="/auth/token")
+    instance.sync()
+
+    login_calls = [r for r in FakeAsyncRequestUtils.requests if "auth/token" in (r[1] or "")]
+    assert login_calls, "应调用登录端点"
+    # 记录的是 json or data；表单体应为 dict 且含 username/password
+    body = login_calls[0][2]
+    assert isinstance(body, dict), body
+    assert body.get("username") == "root"
+    assert body.get("password") == "secret"
+
+
 def test_remote_retries_after_401():
-    """下载遇到 401 时应重新登录并重试一次。"""
     _reset_routes()
     from app.chain.subscribe import SubscribeChain
     from app.db.oper.subscribe import SubscribeOper
