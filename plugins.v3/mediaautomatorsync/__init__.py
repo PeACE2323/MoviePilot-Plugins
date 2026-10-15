@@ -98,7 +98,7 @@ class MediaAutomatorSync(_PluginBase):
     # 插件图标
     plugin_icon = "MediaAutomator_A.png"
     # 插件版本
-    plugin_version = "1.2.3"
+    plugin_version = "1.3.0"
     # 插件作者
     plugin_author = "PeACE2323"
     # 作者主页
@@ -1435,9 +1435,42 @@ class MediaAutomatorSync(_PluginBase):
                 result["skipped"] += 1
             self.__record_history(action, media, outcome.get("message") or "")
 
+    def __season_numbers(self, media_id: str, mtype: Optional[MediaType]) -> List[int]:
+        """
+        查出该剧在 TMDB 上的所有季号。
+
+        MoviePilot 的订阅是「按季」粒度（``SubscribeChain.add`` 不传 season 时默认第 1 季），
+        而 Media Automator 订阅的是整部剧。要覆盖全部季，必须先拿到季列表再逐季订阅。
+
+        :param media_id: TMDB ID
+        :param mtype: 媒体类型
+        :return: 季号列表（升序）；查不到时返回空列表
+        """
+        if mtype != MediaType.TV or not media_id:
+            return []
+        try:
+            mediainfo = MediaChain().recognize_media(
+                mtype=MediaType.TV,
+                media_source=MediaSource.TMDB,
+                media_id=str(media_id),
+            )
+        except Exception as error:
+            logger.warning(f"Media Automator 订阅同步：查询季列表失败：{error}")
+            return []
+        seasons = getattr(mediainfo, "seasons", None) if mediainfo else None
+        if not isinstance(seasons, dict) or not seasons:
+            return []
+        # 季 0 是特别篇，通常不单独订阅，这里同样跳过。
+        return sorted(
+            int(number) for number in seasons if isinstance(number, int) and number > 0
+        )
+
     def __apply_add(self, media: Dict[str, Any], record: Dict[str, Any]) -> Dict[str, Any]:
         """
         在 MoviePilot 上添加订阅。
+
+        电视剧会展开成「每季一条订阅」，与 Media Automator 的整剧订阅语义对齐；
+        电影与其他类型仍按单条订阅处理。
 
         :param media: 从日志中提取的媒体信息
         :param record: 原始日志记录
@@ -1451,6 +1484,12 @@ class MediaAutomatorSync(_PluginBase):
         # 没有标题也没有 TMDB ID 时无法识别，直接跳过。
         if not title and not media_id:
             return {"changed": False, "message": "日志中未提取到标题或 TMDB ID"}
+
+        # 电视剧且有多季时，逐季订阅以覆盖整部剧。
+        if mtype == MediaType.TV and media_id:
+            seasons = self.__season_numbers(str(media_id), mtype)
+            if len(seasons) > 1:
+                return self.__add_each_season(title, year, str(media_id), seasons)
 
         # 判断订阅是否已存在，避免重复添加。
         if media_id:
@@ -1489,6 +1528,84 @@ class MediaAutomatorSync(_PluginBase):
         if not sid:
             return {"changed": False, "message": f"添加订阅失败：{message}"}
         return {"changed": True, "message": f"已添加订阅（{message}）"}
+
+    def __add_each_season(
+        self,
+        title: str,
+        year: str,
+        media_id: str,
+        seasons: List[int],
+    ) -> Dict[str, Any]:
+        """
+        逐季建立订阅。
+
+        :param title: 媒体标题
+        :param year: 年份
+        :param media_id: TMDB ID
+        :param seasons: 季号列表
+        :return: 含 changed 与 message 的结果字典
+        """
+        added: List[int] = []
+        existing: List[int] = []
+        failed: List[int] = []
+        for season in seasons:
+            try:
+                if SubscribeOper().exists(
+                    media_source=MediaSource.TMDB,
+                    media_id=media_id,
+                    season=season,
+                ):
+                    existing.append(season)
+                    continue
+            except Exception as error:
+                logger.warning(
+                    f"Media Automator 订阅同步：查询第 {season} 季订阅失败：{error}"
+                )
+
+            sid, message = SubscribeChain().add(
+                title=title,
+                year=year,
+                mtype=MediaType.TV,
+                media_source=MediaSource.TMDB,
+                media_id=media_id,
+                season=season,
+                username="Media Automator",
+                exist_ok=True,
+            )
+            if sid:
+                added.append(season)
+            else:
+                failed.append(season)
+                logger.warning(
+                    f"Media Automator 订阅同步：{title} 第 {season} 季订阅失败：{message}"
+                )
+
+        parts = []
+        if added:
+            parts.append(f"新增 {len(added)} 季（{self.__format_seasons(added)}）")
+        if existing:
+            parts.append(f"已有 {len(existing)} 季")
+        if failed:
+            parts.append(f"失败 {len(failed)} 季（{self.__format_seasons(failed)}）")
+        summary = "，".join(parts) if parts else "无需处理"
+        return {"changed": bool(added), "message": f"分季订阅：{summary}"}
+
+    @staticmethod
+    def __format_seasons(seasons: List[int]) -> str:
+        """把季号列表压缩成 S1-S3,S5 这样的短文本。"""
+        if not seasons:
+            return ""
+        ordered = sorted(set(seasons))
+        ranges: List[str] = []
+        start = prev = ordered[0]
+        for number in ordered[1:]:
+            if number == prev + 1:
+                prev = number
+                continue
+            ranges.append(f"S{start}" if start == prev else f"S{start}-S{prev}")
+            start = prev = number
+        ranges.append(f"S{start}" if start == prev else f"S{start}-S{prev}")
+        return ",".join(ranges)
 
     def __apply_delete(self, media: Dict[str, Any], record: Dict[str, Any]) -> Dict[str, Any]:
         """

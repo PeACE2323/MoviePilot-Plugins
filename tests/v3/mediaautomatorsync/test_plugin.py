@@ -204,7 +204,22 @@ def _install_stubs() -> None:
     chain_sub = types.ModuleType("app.chain.subscribe")
 
     class MediaChain:
-        pass
+        """
+        MediaChain 替身，用于返回季列表。
+
+        真实 MediaInfo.seasons 是 Dict[int, list]（季号 -> 该季集列表）；
+        recognize_media 查不到时返回 None，插件必须容忍这一点。
+        """
+
+        # tmdb_id -> 季号列表；未登记的返回 None（模拟识别失败）
+        seasons_by_id = {}
+
+        def recognize_media(self, **kwargs):
+            media_id = str(kwargs.get("media_id") or "")
+            seasons = MediaChain.seasons_by_id.get(media_id)
+            if seasons is None:
+                return None
+            return types.SimpleNamespace(seasons={s: [] for s in seasons})
 
     class SubscribeChain:
         """记录 add 调用，返回可配置结果。"""
@@ -245,8 +260,18 @@ def _install_stubs() -> None:
             return getattr(value, "value", value)
 
         def exists(self, media_source=None, media_id=None, **kwargs):
-            key = (self._norm_source(media_source), str(media_id))
-            return key in SubscribeOper.existing
+            """
+            与宿主一致地按身份 + 季号判断订阅是否存在。
+
+            真实 SubscribeOper.exists 接受 season 参数（订阅是按季去重的），
+            忽略它会让「逐季订阅」的测试永远认为不存在，从而掩盖重复订阅的问题。
+            """
+            season = kwargs.get("season")
+            key = (self._norm_source(media_source), str(media_id), season)
+            if key in SubscribeOper.existing:
+                return True
+            # 兼容不关心季号的旧用例：只给 (source, id) 也算命中
+            return (self._norm_source(media_source), str(media_id)) in SubscribeOper.existing
 
         def list_by_media_identity(self, media_source=None, media_id=None, **kwargs):
             want_source = self._norm_source(media_source)
@@ -327,6 +352,7 @@ MediaAutomatorClient = client_module.MediaAutomatorClient
 _network_mod = sys.modules["app.sdk.network"]
 FakeAsyncRequestUtils = _network_mod.AsyncRequestUtils
 FakeResponse = _network_mod._FakeResponse
+FakeMediaChain = sys.modules["app.chain.media"].MediaChain
 
 
 def _ts(minutes_ago: int = 5) -> str:
@@ -762,6 +788,8 @@ def _reset_routes():
     """清空假 HTTP 客户端注册的路由与请求记录。"""
     FakeAsyncRequestUtils.routes = {}
     FakeAsyncRequestUtils.requests = []
+    # 季列表也一并清空，避免用例之间互相影响
+    FakeMediaChain.seasons_by_id = {}
 
 
 def _log_text(records):
@@ -1521,3 +1549,218 @@ def test_action_result_survives_reinit():
     )
     joined = "\n".join(_collect_texts(instance.get_page()))
     assert "查缺补漏（预演）" in joined, joined
+
+
+# --------------------------------------------------------------------------
+# 电视剧多季订阅
+# --------------------------------------------------------------------------
+
+def test_tv_subscription_expands_all_seasons():
+    """
+    多季电视剧必须逐季订阅。
+
+    Media Automator 订阅的是整部剧，而 MoviePilot 的 SubscribeChain.add 在
+    不传 season 时只订第 1 季；不展开会让多季剧只订到第一季。
+    """
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.existing = set()
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "新增订阅成功")
+
+    # JOJO：6 季
+    FakeMediaChain.seasons_by_id = {"45790": [1, 2, 3, 4, 5, 6]}
+
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_source": "file", "log_path": "x.log"})
+    outcome = instance._MediaAutomatorSync__apply_add(
+        {"title": "JOJO的奇妙冒险", "year": "2012", "media_id": "45790", "raw_type": "tv"},
+        {},
+    )
+
+    assert outcome["changed"] is True, outcome
+    seasons = sorted(c.get("season") for c in SubscribeChain.add_calls)
+    assert seasons == [1, 2, 3, 4, 5, 6], seasons
+    # 每一季都必须带上 TMDB 身份
+    assert all(c.get("media_id") == "45790" for c in SubscribeChain.add_calls)
+    assert all(c.get("mtype") == "电视剧" for c in SubscribeChain.add_calls)
+
+
+def test_single_season_tv_uses_single_subscription():
+    """单季剧不应被拆成多条订阅。"""
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.existing = set()
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "新增订阅成功")
+
+    FakeMediaChain.seasons_by_id = {"294446": [1]}
+
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_source": "file", "log_path": "x.log"})
+    outcome = instance._MediaAutomatorSync__apply_add(
+        {"title": "美人余", "year": "2026", "media_id": "294446", "raw_type": "tv"},
+        {},
+    )
+
+    assert outcome["changed"] is True
+    assert len(SubscribeChain.add_calls) == 1, SubscribeChain.add_calls
+    # 单季走普通路径，不应显式传 season
+    assert SubscribeChain.add_calls[0].get("season") is None
+
+
+def test_tv_season_lookup_failure_falls_back():
+    """查不到季列表时应退回单条订阅，而不是直接失败。"""
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.existing = set()
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "新增订阅成功")
+
+    # 未登记 -> recognize_media 返回 None
+    FakeMediaChain.seasons_by_id = {}
+
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_source": "file", "log_path": "x.log"})
+    outcome = instance._MediaAutomatorSync__apply_add(
+        {"title": "某剧", "year": "2024", "media_id": "999", "raw_type": "tv"},
+        {},
+    )
+
+    assert outcome["changed"] is True, outcome
+    assert len(SubscribeChain.add_calls) == 1
+    assert SubscribeChain.add_calls[0].get("media_id") == "999"
+
+
+def test_tv_seasons_skip_already_subscribed():
+    """已订阅的季应跳过，只补缺的季。"""
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    # 已有 1、2 季
+    SubscribeOper.existing = {("themoviedb", "45790", 1), ("themoviedb", "45790", 2)}
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "新增订阅成功")
+
+    FakeMediaChain.seasons_by_id = {"45790": [1, 2, 3]}
+
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_source": "file", "log_path": "x.log"})
+    outcome = instance._MediaAutomatorSync__apply_add(
+        {"title": "JOJO的奇妙冒险", "year": "2012", "media_id": "45790", "raw_type": "tv"},
+        {},
+    )
+
+    assert outcome["changed"] is True
+    assert [c.get("season") for c in SubscribeChain.add_calls] == [3]
+    assert "已有 2 季" in outcome["message"]
+    assert "新增 1 季" in outcome["message"]
+
+
+def test_tv_all_seasons_present_reports_no_change():
+    """所有季都已订阅时不应产生变更，避免重复通知。"""
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.existing = {("themoviedb", "45790", s) for s in (1, 2, 3)}
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    FakeMediaChain.seasons_by_id = {"45790": [1, 2, 3]}
+
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_source": "file", "log_path": "x.log"})
+    outcome = instance._MediaAutomatorSync__apply_add(
+        {"title": "JOJO的奇妙冒险", "year": "2012", "media_id": "45790", "raw_type": "tv"},
+        {},
+    )
+
+    assert outcome["changed"] is False
+    assert SubscribeChain.add_calls == []
+    assert "已有 3 季" in outcome["message"]
+
+
+def test_movie_is_not_season_expanded():
+    """电影不应走分季逻辑。"""
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.existing = set()
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    # 即便误配了季列表，电影也不该展开
+    FakeMediaChain.seasons_by_id = {"1368337": [1, 2, 3]}
+
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_source": "file", "log_path": "x.log"})
+    outcome = instance._MediaAutomatorSync__apply_add(
+        {"title": "奥德赛", "year": "2026", "media_id": "1368337", "raw_type": "movie"},
+        {},
+    )
+
+    assert outcome["changed"] is True
+    assert len(SubscribeChain.add_calls) == 1
+    assert SubscribeChain.add_calls[0].get("season") is None
+
+
+def test_format_seasons_compacts_ranges():
+    """季号展示应压缩连续区间。"""
+    fmt = MediaAutomatorSync._MediaAutomatorSync__format_seasons
+    assert fmt([1, 2, 3]) == "S1-S3"
+    assert fmt([1]) == "S1"
+    assert fmt([1, 2, 4, 5, 6]) == "S1-S2,S4-S6"
+    assert fmt([2, 1]) == "S1-S2"
+    assert fmt([]) == ""
+
+
+def test_reconcile_expands_tv_seasons():
+    """查缺补漏对多季剧同样要逐季补齐。"""
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.existing = set()
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    FakeAsyncRequestUtils.routes = {
+        "/auth/token": FakeResponse(200, "", {"access_token": "t"}),
+        "/api/subscriptions": FakeResponse(
+            200,
+            "",
+            {
+                "tv": {
+                    "items": [
+                        {"id": 1, "tmdb_id": 45790, "media_type": "tv", "title": "JOJO", "year": "2012"}
+                    ],
+                    "total_items": 1,
+                },
+                "movie": {"items": []},
+            },
+        ),
+    }
+    FakeMediaChain.seasons_by_id = {"45790": [1, 2, 3]}
+
+    instance = _http_plugin(ma_login_path="/auth/token")
+    result = instance.api_reconcile()
+
+    assert result.success is True, result.message
+    seasons = sorted(c.get("season") for c in SubscribeChain.add_calls)
+    assert seasons == [1, 2, 3], seasons
