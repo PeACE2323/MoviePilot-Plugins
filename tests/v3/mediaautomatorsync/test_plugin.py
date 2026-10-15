@@ -1312,3 +1312,71 @@ def test_reconcile_reports_error_when_unreachable():
     result = instance.api_reconcile()
     assert result["success"] is False
     assert result["message"]
+
+
+# --------------------------------------------------------------------------
+# 详情页操作按钮
+# --------------------------------------------------------------------------
+
+def _collect_buttons(node, found=None):
+    """递归收集页面 JSON 里的所有 VBtn。"""
+    if found is None:
+        found = []
+    if isinstance(node, dict):
+        if node.get("component") == "VBtn":
+            found.append(node)
+        for value in node.values():
+            _collect_buttons(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            _collect_buttons(value, found)
+    return found
+
+
+def test_page_exposes_action_buttons_in_http_mode():
+    """HTTP 模式详情页应提供同步、测试连接与查缺补漏按钮，且 API 路径正确。"""
+    instance = _http_plugin()
+    buttons = _collect_buttons(instance.get_page())
+    calls = {}
+    for btn in buttons:
+        click = (btn.get("events") or {}).get("click") or {}
+        calls[btn.get("text")] = (click.get("api"), click.get("params") or {})
+
+    # 路径必须遵循 plugin/<PluginID>/<path> 约定，否则前端调用会 404
+    assert calls["立即同步一次"][0] == "plugin/MediaAutomatorSync/run"
+    assert calls["测试连接"][0] == "plugin/MediaAutomatorSync/test"
+    assert calls["查缺补漏（预演）"][0] == "plugin/MediaAutomatorSync/reconcile"
+    # 预演必须带 dry_run，避免误触发真实写入
+    assert calls["查缺补漏（预演）"][1].get("dry_run") is True
+    assert calls["查缺补漏（补齐订阅）"][0] == "plugin/MediaAutomatorSync/reconcile"
+    assert "dry_run" not in calls["查缺补漏（补齐订阅）"][1]
+
+
+def test_page_hides_reconcile_buttons_in_file_mode():
+    """文件模式无法读取 MA 订阅清单，查缺补漏按钮应隐藏。"""
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_source": "file", "log_path": "x.log"})
+    texts = [btn.get("text") for btn in _collect_buttons(instance.get_page())]
+    assert "立即同步一次" in texts
+    assert "测试连接" in texts
+    assert not any("查缺补漏" in (t or "") for t in texts)
+
+
+def test_every_page_action_targets_a_registered_api():
+    """
+    详情页里每个按钮调用的路径都必须存在于 get_api() 声明中。
+
+    这是防止「按钮点了 404」的关键：路径写错时插件加载正常，只有用户点下去才暴露。
+    """
+    instance = _http_plugin()
+    declared = {
+        f"plugin/MediaAutomatorSync{api['path']}"
+        for api in instance.get_api()
+    }
+    for btn in _collect_buttons(instance.get_page()):
+        click = (btn.get("events") or {}).get("click") or {}
+        api_path = click.get("api")
+        if not api_path:
+            continue
+        # 调用的 path 可能带 query，这里只比对路径部分
+        assert api_path in declared, f"按钮「{btn.get('text')}」指向未声明的 API：{api_path}"

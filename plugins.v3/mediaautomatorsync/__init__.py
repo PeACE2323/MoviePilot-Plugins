@@ -97,7 +97,7 @@ class MediaAutomatorSync(_PluginBase):
     # 插件图标
     plugin_icon = "MediaAutomator_A.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     # 插件作者
     plugin_author = "PeACE2323"
     # 作者主页
@@ -668,8 +668,134 @@ class MediaAutomatorSync(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        """返回详情页，展示最近一次同步结果与处理历史。"""
+        """返回详情页，展示操作按钮、运行状态与处理历史。"""
         contents: List[dict] = []
+
+        # 操作按钮区：详情页不能输入，因此用带固定参数的 API 调用实现「点一下就跑」。
+        contents.append(
+            {
+                "component": "VRow",
+                "props": {"class": "mb-2"},
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "color": "primary",
+                                    "variant": "flat",
+                                    "block": True,
+                                    "prepend-icon": "mdi-sync",
+                                },
+                                "text": "立即同步一次",
+                                "events": {
+                                    "click": {
+                                        "api": "plugin/MediaAutomatorSync/run",
+                                        "method": "get",
+                                    }
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "color": "info",
+                                    "variant": "tonal",
+                                    "block": True,
+                                    "prepend-icon": "mdi-connection",
+                                },
+                                "text": "测试连接",
+                                "events": {
+                                    "click": {
+                                        "api": "plugin/MediaAutomatorSync/test",
+                                        "method": "get",
+                                    }
+                                },
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+
+        # 查缺补漏：需要远程 HTTP 模式才能读取 MA 的订阅清单。
+        if self._log_source == LOG_SOURCE_HTTP:
+            contents.append(
+                {
+                    "component": "VRow",
+                    "props": {"class": "mb-2"},
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 6},
+                            "content": [
+                                {
+                                    "component": "VBtn",
+                                    "props": {
+                                        "color": "warning",
+                                        "variant": "tonal",
+                                        "block": True,
+                                        "prepend-icon": "mdi-clipboard-search-outline",
+                                    },
+                                    "text": "查缺补漏（预演）",
+                                    "events": {
+                                        "click": {
+                                            "api": "plugin/MediaAutomatorSync/reconcile",
+                                            "method": "get",
+                                            "params": {"dry_run": True},
+                                        }
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 6},
+                            "content": [
+                                {
+                                    "component": "VBtn",
+                                    "props": {
+                                        "color": "success",
+                                        "variant": "flat",
+                                        "block": True,
+                                        "prepend-icon": "mdi-playlist-plus",
+                                    },
+                                    "text": "查缺补漏（补齐订阅）",
+                                    "events": {
+                                        "click": {
+                                            "api": "plugin/MediaAutomatorSync/reconcile",
+                                            "method": "get",
+                                        }
+                                    },
+                                }
+                            ],
+                        },
+                    ],
+                }
+            )
+            contents.append(
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "info",
+                        "variant": "tonal",
+                        "density": "compact",
+                        "class": "mb-2",
+                        "text": (
+                            "「预演」只列出 MoviePilot 缺少的订阅，不会写入；"
+                            "「补齐」会真正添加。也可以直接在地址栏调用 "
+                            "/reconcile?limit=5 分批补，避免一次添加过多。"
+                        ),
+                    },
+                }
+            )
 
         # 运行状态摘要
         if self._log_source == LOG_SOURCE_HTTP:
@@ -709,7 +835,7 @@ class MediaAutomatorSync(_PluginBase):
                     "props": {
                         "type": "info",
                         "variant": "tonal",
-                        "text": "暂无同步记录。请确认日志路径可读，或点击“立即运行一次”。",
+                        "text": "暂无同步记录。可点击上方「立即同步一次」，或用「查缺补漏」补齐历史订阅。",
                     },
                 }
             )
