@@ -98,7 +98,7 @@ class MediaAutomatorSync(_PluginBase):
     # 插件图标
     plugin_icon = "MediaAutomator_A.png"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     # 插件作者
     plugin_author = "PeACE2323"
     # 作者主页
@@ -134,6 +134,7 @@ class MediaAutomatorSync(_PluginBase):
         self._delete_patterns: str = DEFAULT_DELETE_PATTERNS
         self._sync_add: bool = True
         self._sync_delete: bool = True
+        self._include_specials: bool = True
         self._default_type: str = "auto"
         self._max_lines: int = 2000
         self._max_age_days: int = 30
@@ -178,6 +179,7 @@ class MediaAutomatorSync(_PluginBase):
         self._delete_patterns = str(config.get("delete_patterns") or DEFAULT_DELETE_PATTERNS)
         self._sync_add = bool(config.get("sync_add", True))
         self._sync_delete = bool(config.get("sync_delete", True))
+        self._include_specials = bool(config.get("include_specials", True))
         self._default_type = str(config.get("default_type") or "auto")
         self._max_lines = self._parse_positive_int(config.get("max_lines"), 2000)
         self._max_age_days = self._parse_positive_int(config.get("max_age_days"), 30)
@@ -533,6 +535,21 @@ class MediaAutomatorSync(_PluginBase):
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "include_specials",
+                                            "label": "订阅特别篇（季 0）",
+                                            "hint": "关闭后只订阅正季；特别篇常含预告花絮，可能产生较多无效搜索",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
                                         "component": "VSelect",
                                         "props": {
                                             "model": "default_type",
@@ -677,6 +694,7 @@ class MediaAutomatorSync(_PluginBase):
             "cron": "*/2 * * * *",
             "sync_add": True,
             "sync_delete": True,
+            "include_specials": True,
             "default_type": "auto",
             "add_patterns": DEFAULT_ADD_PATTERNS,
             "delete_patterns": DEFAULT_DELETE_PATTERNS,
@@ -1460,10 +1478,14 @@ class MediaAutomatorSync(_PluginBase):
         seasons = getattr(mediainfo, "seasons", None) if mediainfo else None
         if not isinstance(seasons, dict) or not seasons:
             return []
-        # 季 0 是特别篇，通常不单独订阅，这里同样跳过。
-        return sorted(
-            int(number) for number in seasons if isinstance(number, int) and number > 0
-        )
+        numbers = [
+            int(number) for number in seasons if isinstance(number, int) and number >= 0
+        ]
+        if not self._include_specials:
+            # 季 0 是特别篇（预告、花絮、访谈等混杂内容），订上会产生较多无效搜索，
+            # 因此是否包含交给用户配置。
+            numbers = [number for number in numbers if number > 0]
+        return sorted(numbers)
 
     def __apply_add(self, media: Dict[str, Any], record: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -1485,10 +1507,12 @@ class MediaAutomatorSync(_PluginBase):
         if not title and not media_id:
             return {"changed": False, "message": "日志中未提取到标题或 TMDB ID"}
 
-        # 电视剧且有多季时，逐季订阅以覆盖整部剧。
+        # 电视剧逐季订阅，覆盖整部剧。
+        # 只在「季列表就是默认的第 1 季」时才走单条路径——否则必须显式逐季，
+        # 否则像「只有季 0 的特别篇」会被 MP 默认成第 1 季，订错内容。
         if mtype == MediaType.TV and media_id:
             seasons = self.__season_numbers(str(media_id), mtype)
-            if len(seasons) > 1:
+            if seasons and seasons != [1]:
                 return self.__add_each_season(title, year, str(media_id), seasons)
 
         # 判断订阅是否已存在，避免重复添加。
@@ -2035,6 +2059,7 @@ class MediaAutomatorSync(_PluginBase):
                 "cron": self._cron,
                 "sync_add": self._sync_add,
                 "sync_delete": self._sync_delete,
+                "include_specials": self._include_specials,
                 "default_type": self._default_type,
                 "add_patterns": self._add_patterns,
                 "delete_patterns": self._delete_patterns,

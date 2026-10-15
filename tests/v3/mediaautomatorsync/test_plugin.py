@@ -1729,6 +1729,89 @@ def test_format_seasons_compacts_ranges():
     assert fmt([]) == ""
 
 
+def test_specials_included_by_default():
+    """默认包含季 0（特别篇）。"""
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.existing = set()
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    FakeMediaChain.seasons_by_id = {"100": [0, 1, 2]}
+
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_source": "file", "log_path": "x.log"})
+    instance._MediaAutomatorSync__apply_add(
+        {"title": "某剧", "year": "2024", "media_id": "100", "raw_type": "tv"}, {}
+    )
+
+    seasons = sorted(c.get("season") for c in SubscribeChain.add_calls)
+    assert seasons == [0, 1, 2], seasons
+
+
+def test_specials_can_be_excluded():
+    """关闭开关后不订阅季 0，只订正季。"""
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.existing = set()
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    FakeMediaChain.seasons_by_id = {"100": [0, 1, 2]}
+
+    instance = MediaAutomatorSync()
+    instance.init_plugin(
+        {
+            "enabled": True,
+            "log_source": "file",
+            "log_path": "x.log",
+            "include_specials": False,
+        }
+    )
+    instance._MediaAutomatorSync__apply_add(
+        {"title": "某剧", "year": "2024", "media_id": "100", "raw_type": "tv"}, {}
+    )
+
+    seasons = sorted(c.get("season") for c in SubscribeChain.add_calls)
+    assert seasons == [1, 2], seasons
+
+
+def test_specials_only_show_still_subscribes():
+    """只有特别篇的剧（仅季 0）在开启开关时仍应订阅，而不是被整体跳过。"""
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.existing = set()
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    FakeMediaChain.seasons_by_id = {"200": [0]}
+
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_source": "file", "log_path": "x.log"})
+    outcome = instance._MediaAutomatorSync__apply_add(
+        {"title": "特别篇合集", "year": "2024", "media_id": "200", "raw_type": "tv"}, {}
+    )
+
+    assert outcome["changed"] is True
+    assert [c.get("season") for c in SubscribeChain.add_calls] == [0]
+
+
+def test_include_specials_defaults_to_true():
+    """未配置时默认包含特别篇。"""
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_source": "file", "log_path": "x.log"})
+    assert instance._include_specials is True
+
+
 def test_reconcile_expands_tv_seasons():
     """查缺补漏对多季剧同样要逐季补齐。"""
     _reset_routes()
