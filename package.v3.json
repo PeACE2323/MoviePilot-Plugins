@@ -8,7 +8,6 @@
     "author": "PeACE2323",
     "project_url": "https://github.com/PeACE2323/MoviePilot-Plugins",
     "level": 1,
-    "release": true,
     "system_version": ">=3.0.0",
     "history": {
       "v1.1.1": "修复远程鉴权：改用登录下发的 cookie。",
