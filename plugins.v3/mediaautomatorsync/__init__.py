@@ -98,7 +98,7 @@ class MediaAutomatorSync(_PluginBase):
     # 插件图标
     plugin_icon = "MediaAutomator_A.png"
     # 插件版本
-    plugin_version = "1.2.2"
+    plugin_version = "1.2.3"
     # 插件作者
     plugin_author = "PeACE2323"
     # 作者主页
@@ -144,6 +144,8 @@ class MediaAutomatorSync(_PluginBase):
         self._history: List[Dict[str, Any]] = []
         self._last_error: str = ""
         self._last_run: str = ""
+        # 最近一次手动操作的结果，供详情页在重新加载后展示。
+        self._last_action: Dict[str, Any] = {}
         # 远程客户端按配置缓存，登录得到的 Token 可以跨轮询复用。
         self._client: Optional[MediaAutomatorClient] = None
 
@@ -185,12 +187,15 @@ class MediaAutomatorSync(_PluginBase):
         self._cursor = self.get_data("cursor") or {}
         self._http_state = self.get_data("http_state") or {}
         self._history = self.get_data("history") or []
+        self._last_action = self.get_data("last_action") or {}
         if not isinstance(self._cursor, dict):
             self._cursor = {}
         if not isinstance(self._http_state, dict):
             self._http_state = {}
         if not isinstance(self._history, list):
             self._history = []
+        if not isinstance(self._last_action, dict):
+            self._last_action = {}
 
         # 每次初始化重建客户端：配置可能已变，旧的 Token 不应被沿用。
         self._client = None
@@ -810,6 +815,36 @@ class MediaAutomatorSync(_PluginBase):
                 }
             )
 
+        # 最近一次手动操作的结果。
+        # 详情页按钮的机制是「调接口 → 重新加载页面数据」，接口返回值不会被渲染，
+        # 所以这里把结果读出来展示，否则用户点击后只会看到进度条闪一下就消失。
+        if self._last_action:
+            detail_text = self._last_action.get("message") or ""
+            details = self._last_action.get("details") or []
+            if details:
+                detail_text += "\n" + "\n".join(f"· {line}" for line in details)
+            contents.append(
+                {
+                    "component": "VCard",
+                    "props": {"variant": "tonal", "color": "primary", "class": "mb-2"},
+                    "content": [
+                        {
+                            "component": "VCardTitle",
+                            "props": {"class": "text-subtitle-1"},
+                            "text": (
+                                f"{self._last_action.get('title') or '操作结果'}"
+                                f"（{self._last_action.get('time') or ''}）"
+                            ),
+                        },
+                        {
+                            "component": "VCardText",
+                            "props": {"class": "text-body-2", "style": "white-space: pre-wrap;"},
+                            "text": detail_text,
+                        },
+                    ],
+                }
+            )
+
         # 运行状态摘要
         if self._log_source == LOG_SOURCE_HTTP:
             source_line = f"日志来源：远程 HTTP（{self._ma_url or '未填写地址'}，用户 {self._ma_username}）"
@@ -945,6 +980,23 @@ class MediaAutomatorSync(_PluginBase):
             )
         return schemas.Response(success=True, message="", data=status)
 
+    def __record_action(self, title: str, message: str, details: Optional[List[str]] = None) -> None:
+        """
+        记录一次手动操作的结果，供详情页展示。
+
+        详情页按钮的机制是「调接口 → 重新加载页面数据」，接口的返回值不会被渲染；
+        因此结果必须写进插件数据，页面重新加载后才能看到，否则点击只会「闪一下」。
+        """
+        entry = {
+            "title": title,
+            "message": message,
+            "details": (details or [])[:50],
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with self._state_lock:
+            self._last_action = entry
+            self.save_data("last_action", entry)
+
     def api_test(self) -> schemas.Response:
         """
         测试与 Media Automator 的连通性与登录。
@@ -955,15 +1007,18 @@ class MediaAutomatorSync(_PluginBase):
         if self._log_source != LOG_SOURCE_HTTP:
             path = Path(self._log_path) if self._log_path else None
             if not path or not path.exists():
-                return schemas.Response(success=False, message=f"日志文件不存在：{self._log_path}")
+                message = f"日志文件不存在：{self._log_path}"
+                self.__record_action("测试连接", message)
+                return schemas.Response(success=False, message=message)
             try:
                 lines = self.__read_tail_lines(self._log_path, 1)
             except (OSError, ValueError) as error:
-                return schemas.Response(success=False, message=f"读取日志失败：{error}")
-            return schemas.Response(
-                success=True,
-                message=f"日志文件可读，大小 {path.stat().st_size} 字节，末行可得 {len(lines)} 行",
-            )
+                message = f"读取日志失败：{error}"
+                self.__record_action("测试连接", message)
+                return schemas.Response(success=False, message=message)
+            message = f"日志文件可读，大小 {path.stat().st_size} 字节，末行可得 {len(lines)} 行"
+            self.__record_action("测试连接", message)
+            return schemas.Response(success=True, message=message)
 
         client = self.__get_client()
         ok, message = self.__run_async(client.login_only())
@@ -971,6 +1026,7 @@ class MediaAutomatorSync(_PluginBase):
         if ok and client._resolved_login_path and not self._ma_login_path:
             self._ma_login_path = client._resolved_login_path
             self.__update_config()
+        self.__record_action("测试连接", message)
         return schemas.Response(success=ok, message=message)
 
     def api_probe(self, limit: int = 50) -> schemas.Response:
@@ -1025,11 +1081,11 @@ class MediaAutomatorSync(_PluginBase):
         :return: 统计结果
         """
         if self._log_source != LOG_SOURCE_HTTP:
-            return schemas.Response(
-                success=False,
-                message="查缺补漏需要「远程 HTTP」日志来源（要调用订阅清单接口）",
-            )
+            message = "查缺补漏需要「远程 HTTP」日志来源（要调用订阅清单接口）"
+            self.__record_action("查缺补漏", message)
+            return schemas.Response(success=False, message=message)
         if not self._enabled:
+            self.__record_action("查缺补漏", "插件未启用")
             return schemas.Response(success=False, message="插件未启用")
 
         limit = self._parse_non_negative_int(limit, 0)
@@ -1037,6 +1093,7 @@ class MediaAutomatorSync(_PluginBase):
         records = self.__run_async(client.fetch_subscriptions())
         if records is None:
             self._last_error = client.last_error or "拉取订阅清单失败"
+            self.__record_action("查缺补漏", f"失败：{self._last_error}")
             return schemas.Response(success=False, message=self._last_error, data=[])
 
         existing = 0
@@ -1095,6 +1152,17 @@ class MediaAutomatorSync(_PluginBase):
         logger.info(f"Media Automator 查缺补漏完成：{summary}")
         if not dry_run and (added or failed):
             self.__notify_reconcile(summary)
+        # 详情页不渲染接口返回值，把结果落盘供页面重新加载后展示。
+        detail_lines = [
+            f"{item['title']}（{item['year'] or '未知年份'}）"
+            + (f" → {item.get('result')}" if not dry_run else "")
+            for item in (planned if dry_run else details)
+        ]
+        self.__record_action(
+            "查缺补漏（预演）" if dry_run else "查缺补漏（补齐订阅）",
+            summary,
+            detail_lines,
+        )
         return schemas.Response(
             success=True,
             message=summary,

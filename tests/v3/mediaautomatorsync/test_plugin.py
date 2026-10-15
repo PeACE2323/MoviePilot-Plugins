@@ -1351,6 +1351,22 @@ def _collect_buttons(node, found=None):
     return found
 
 
+def _collect_texts(node, found=None):
+    """递归收集页面 JSON 里所有的 text 字段，用于断言页面到底显示了什么。"""
+    if found is None:
+        found = []
+    if isinstance(node, dict):
+        value = node.get("text")
+        if isinstance(value, str):
+            found.append(value)
+        for item in node.values():
+            _collect_texts(item, found)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_texts(item, found)
+    return found
+
+
 def test_page_exposes_action_buttons_in_http_mode():
     """HTTP 模式详情页应提供同步、测试连接与查缺补漏按钮，且 API 路径正确。"""
     instance = _http_plugin()
@@ -1441,3 +1457,67 @@ def test_api_methods_return_response_envelope():
     assert isinstance(rejected, Response)
     assert rejected.success is False
     assert "远程 HTTP" in rejected.message
+
+
+def test_reconcile_result_is_visible_after_page_reload():
+    """
+    手动操作的结果必须能在详情页看到。
+
+    详情页按钮的机制是「调接口 → 重新加载页面数据」，接口的返回值不会被渲染。
+    因此结果必须落盘到插件数据，否则用户点击后只会看到进度条闪一下，以为没反应。
+    """
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.existing = set()
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    FakeAsyncRequestUtils.routes = {
+        "/auth/token": FakeResponse(200, "", {"access_token": "t"}),
+        "/api/subscriptions": FakeResponse(200, "", SUBSCRIPTIONS_PAYLOAD),
+    }
+    instance = _http_plugin(ma_login_path="/auth/token")
+    instance.api_reconcile(dry_run=True)
+
+    # 重新加载页面（模拟前端点击后的刷新）
+    texts = _collect_texts(instance.get_page())
+    joined = "\n".join(texts)
+    assert "查缺补漏（预演）" in joined, joined
+    assert "MA 共 3 条订阅" in joined, joined
+    # 明细里应逐条列出待补的媒体
+    assert "美人余" in joined, joined
+
+
+def test_action_result_survives_reinit():
+    """操作结果写入插件存储，宿主重入 init_plugin 后仍应在详情页可见。"""
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.existing = set()
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    FakeAsyncRequestUtils.routes = {
+        "/auth/token": FakeResponse(200, "", {"access_token": "t"}),
+        "/api/subscriptions": FakeResponse(200, "", SUBSCRIPTIONS_PAYLOAD),
+    }
+    instance = _http_plugin(ma_login_path="/auth/token")
+    instance.api_reconcile(dry_run=True)
+
+    # 宿主保存配置/更新插件时会重入 init_plugin，结果不应丢失
+    instance.init_plugin(
+        {
+            "enabled": True,
+            "log_source": "http",
+            "ma_url": BASE,
+            "ma_username": "root",
+            "ma_password": "secret",
+        }
+    )
+    joined = "\n".join(_collect_texts(instance.get_page()))
+    assert "查缺补漏（预演）" in joined, joined
