@@ -98,7 +98,7 @@ class MediaAutomatorSync(_PluginBase):
     # 插件图标
     plugin_icon = "MediaAutomator_A.png"
     # 插件版本
-    plugin_version = "1.3.1"
+    plugin_version = "1.4.0"
     # 插件作者
     plugin_author = "PeACE2323"
     # 作者主页
@@ -135,6 +135,9 @@ class MediaAutomatorSync(_PluginBase):
         self._sync_add: bool = True
         self._sync_delete: bool = True
         self._include_specials: bool = True
+        # 订阅写入时是否强制关闭洗版：True 表示传 best_version=False，
+        # False 表示沿用 MoviePilot 的默认订阅规则。
+        self._force_no_best_version: bool = False
         self._default_type: str = "auto"
         self._max_lines: int = 2000
         self._max_age_days: int = 30
@@ -180,6 +183,7 @@ class MediaAutomatorSync(_PluginBase):
         self._sync_add = bool(config.get("sync_add", True))
         self._sync_delete = bool(config.get("sync_delete", True))
         self._include_specials = bool(config.get("include_specials", True))
+        self._force_no_best_version = bool(config.get("force_no_best_version", False))
         self._default_type = str(config.get("default_type") or "auto")
         self._max_lines = self._parse_positive_int(config.get("max_lines"), 2000)
         self._max_age_days = self._parse_positive_int(config.get("max_age_days"), 30)
@@ -550,6 +554,25 @@ class MediaAutomatorSync(_PluginBase):
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "force_no_best_version",
+                                            "label": "订阅时关闭洗版",
+                                            "hint": (
+                                                "开启后同步过来的订阅固定为普通订阅。"
+                                                "若主程序默认规则或洗版插件把新订阅设为洗版，"
+                                                "首次同步的剧会因缺少可比较的已入库版本而一直洗版却不下载"
+                                            ),
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
                                         "component": "VSelect",
                                         "props": {
                                             "model": "default_type",
@@ -695,6 +718,7 @@ class MediaAutomatorSync(_PluginBase):
             "sync_add": True,
             "sync_delete": True,
             "include_specials": True,
+            "force_no_best_version": False,
             "default_type": "auto",
             "add_patterns": DEFAULT_ADD_PATTERNS,
             "delete_patterns": DEFAULT_DELETE_PATTERNS,
@@ -1453,6 +1477,24 @@ class MediaAutomatorSync(_PluginBase):
                 result["skipped"] += 1
             self.__record_history(action, media, outcome.get("message") or "")
 
+    def __best_version_kwargs(self) -> Dict[str, Any]:
+        """
+        构造订阅写入时的洗版参数。
+
+        ``SubscribeChain.add`` 对 ``best_version`` 的语义是：传 ``None`` 或干脆不传
+        就沿用 MoviePilot 的默认订阅规则；传 ``False`` 才会显式关掉。
+
+        这一点很关键：若用户装了「订阅助手（增强版）」这类会自动创建洗版订阅的插件，
+        或主程序默认规则里开了洗版，那么同步过来的订阅会立刻变成洗版状态。洗版要求
+        存在「可与之比较的已入库版本」，而首次同步的剧一集都没有，于是会陷入
+        「一直洗版、从不下载」的状态。此开关用于把这类订阅固定为普通订阅。
+
+        :return: 传给 SubscribeChain.add 的额外关键字参数
+        """
+        if self._force_no_best_version:
+            return {"best_version": False, "best_version_full": False}
+        return {}
+
     def __season_numbers(self, media_id: str, mtype: Optional[MediaType]) -> List[int]:
         """
         查出该剧在 TMDB 上的所有季号。
@@ -1536,6 +1578,7 @@ class MediaAutomatorSync(_PluginBase):
             media_id=str(media_id) if media_id else None,
             username="Media Automator",
             exist_ok=True,
+            **self.__best_version_kwargs(),
         )
         # TMDB 身份识别失败时回退到按标题识别，尽量不丢订阅。
         if not sid and media_id and title:
@@ -1548,6 +1591,7 @@ class MediaAutomatorSync(_PluginBase):
                 mtype=mtype,
                 username="Media Automator",
                 exist_ok=True,
+                **self.__best_version_kwargs(),
             )
         if not sid:
             return {"changed": False, "message": f"添加订阅失败：{message}"}
@@ -1595,6 +1639,7 @@ class MediaAutomatorSync(_PluginBase):
                 season=season,
                 username="Media Automator",
                 exist_ok=True,
+                **self.__best_version_kwargs(),
             )
             if sid:
                 added.append(season)
@@ -2060,6 +2105,7 @@ class MediaAutomatorSync(_PluginBase):
                 "sync_add": self._sync_add,
                 "sync_delete": self._sync_delete,
                 "include_specials": self._include_specials,
+                "force_no_best_version": self._force_no_best_version,
                 "default_type": self._default_type,
                 "add_patterns": self._add_patterns,
                 "delete_patterns": self._delete_patterns,

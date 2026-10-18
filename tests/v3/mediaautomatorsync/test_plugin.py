@@ -1812,6 +1812,127 @@ def test_include_specials_defaults_to_true():
     assert instance._include_specials is True
 
 
+# --------------------------------------------------------------------------
+# 洗版开关
+# --------------------------------------------------------------------------
+
+def test_best_version_not_forced_by_default():
+    """
+    默认不干预洗版：完全不传 best_version，沿用 MoviePilot 的默认订阅规则。
+    """
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.existing = set()
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_source": "file", "log_path": "x.log"})
+    instance._MediaAutomatorSync__apply_add(
+        {"title": "沙丘2", "year": "2024", "media_id": "693134", "raw_type": "movie"}, {}
+    )
+
+    assert len(SubscribeChain.add_calls) == 1
+    assert "best_version" not in SubscribeChain.add_calls[0]
+
+
+def test_force_no_best_version_marks_subscription_as_normal():
+    """
+    开启开关后必须显式传 best_version=False。
+
+    否则若主程序默认规则或洗版插件把新订阅设为洗版，首次同步的剧没有任何可比较的
+    已入库版本，就会陷入「一直洗版、从不下载」——这正是线上实际发生的现象。
+    """
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.existing = set()
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    instance = MediaAutomatorSync()
+    instance.init_plugin(
+        {
+            "enabled": True,
+            "log_source": "file",
+            "log_path": "x.log",
+            "force_no_best_version": True,
+        }
+    )
+    instance._MediaAutomatorSync__apply_add(
+        {"title": "沙丘2", "year": "2024", "media_id": "693134", "raw_type": "movie"}, {}
+    )
+
+    call = SubscribeChain.add_calls[0]
+    assert call.get("best_version") is False, call
+    assert call.get("best_version_full") is False, call
+
+
+def test_force_no_best_version_applies_to_each_season():
+    """逐季订阅时每一季都要带上洗版开关，漏一季就会留下洗版订阅。"""
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.existing = set()
+    SubscribeOper.rows = []
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    FakeMediaChain.seasons_by_id = {"45790": [1, 2, 3]}
+
+    instance = MediaAutomatorSync()
+    instance.init_plugin(
+        {
+            "enabled": True,
+            "log_source": "file",
+            "log_path": "x.log",
+            "force_no_best_version": True,
+        }
+    )
+    instance._MediaAutomatorSync__apply_add(
+        {"title": "JOJO的奇妙冒险", "year": "2012", "media_id": "45790", "raw_type": "tv"}, {}
+    )
+
+    assert len(SubscribeChain.add_calls) == 3
+    for call in SubscribeChain.add_calls:
+        assert call.get("best_version") is False, call
+
+
+def test_force_no_best_version_defaults_to_false():
+    """默认不强制关闭洗版，避免覆盖用户自己的订阅偏好。"""
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_source": "file", "log_path": "x.log"})
+    assert instance._force_no_best_version is False
+
+
+def test_force_no_best_version_exposed_in_form():
+    """配置页必须提供该开关，否则用户无法启用。"""
+    instance = MediaAutomatorSync()
+    form, default = instance.get_form()
+    models = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            props = node.get("props") or {}
+            if isinstance(props, dict) and "model" in props:
+                models.append(props["model"])
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(form)
+    assert "force_no_best_version" in models
+    assert default.get("force_no_best_version") is False
+
+
 def test_reconcile_expands_tv_seasons():
     """查缺补漏对多季剧同样要逐季补齐。"""
     _reset_routes()
