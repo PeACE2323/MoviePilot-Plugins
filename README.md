@@ -9,7 +9,7 @@
 
 | 插件 ID | 名称 | 版本 | 说明 |
 | --- | --- | --- | --- |
-| `MediaAutomatorSync` | [Media Automator 订阅同步](plugins.v3/mediaautomatorsync/README.md) | 1.1.0 | 读取 Media Automator 日志，自动同步订阅的新增与删除 |
+| `MediaAutomatorSync` | [Media Automator 订阅同步](plugins.v3/mediaautomatorsync/README.md) | 1.5.0 | 读取 Media Automator 日志，自动同步订阅的新增与删除 |
 
 ## 安装方式
 

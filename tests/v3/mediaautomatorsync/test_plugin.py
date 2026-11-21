@@ -285,6 +285,19 @@ def _install_stubs() -> None:
         def list(self, state=None):
             return list(SubscribeOper.rows)
 
+        def list_by_username(self, username, state=None, mtype=None):
+            """
+            与宿主一致：按订阅用户筛选。
+
+            清理端点靠这一条区分「插件建的订阅」与「用户手动建的订阅」，
+            替身里若忽略 username 过滤，就会把用户自己的订阅也列进待删名单，
+            测试反而会掩盖最危险的那种误删。
+            """
+            return [
+                r for r in SubscribeOper.rows
+                if getattr(r, "username", None) == username
+            ]
+
         def delete(self, sid):
             SubscribeOper.deleted.append(sid)
 
@@ -522,10 +535,56 @@ def _write_log(path: Path, records):
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def test_sync_add_and_delete(tmp_path):
-    """一次同步应同时处理新增与删除，并推进读取位置。"""
+def _append_log(path: Path, records):
+    """向 JSON 行日志追加记录，模拟运行期产生的新事件。"""
+    with path.open("a", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _prime_file(tmp_path: Path, **overrides):
+    """
+    建一份只含陈旧记录的日志并同步一次，得到「已建立基线」的插件实例。
+
+    v1.5.0 起首次同步只记录读取位置与水位线、不执行任何历史事件——这正是误同步
+    事故（MA 上只订阅了《女士的法则》，MP 里却多出整个暮光之城系列）的修复点。
+    因此凡是要验证「新事件会被处理」的用例，都必须先建立基线再追加新行。
+
+    :param tmp_path: 用例专属临时目录
+    :param overrides: 覆盖默认配置
+    :return: (插件实例, 日志路径)
+    """
     log_file = tmp_path / "app.log"
     _write_log(
+        log_file,
+        [{"timestamp": _ts(120), "level": "INFO", "message": "服务启动"}],
+    )
+    config = {"enabled": True, "log_path": str(log_file)}
+    config.update(overrides)
+    instance = MediaAutomatorSync()
+    instance.init_plugin(config)
+    baseline = instance.sync()
+    assert baseline["added"] == 0 and baseline["deleted"] == 0, baseline
+    return instance, log_file
+
+
+def test_sync_add_and_delete(tmp_path):
+    """一次同步应同时处理新增与删除，并推进读取位置。"""
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    instance, log_file = _prime_file(tmp_path)
+
+    # 为删除路径准备一条 MoviePilot 订阅。
+    row = types.SimpleNamespace(id=42, name="某剧", media_source="themoviedb", media_id="111")
+    SubscribeOper.rows = [row]
+    SubscribeOper.deleted = []
+    SubscribeOper.existing = set()
+
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (7, "新增订阅成功")
+
+    _append_log(
         log_file,
         [
             {
@@ -543,21 +602,6 @@ def test_sync_add_and_delete(tmp_path):
         ],
     )
 
-    from app.db.oper.subscribe import SubscribeOper
-
-    # 为删除路径准备一条 MoviePilot 订阅。
-    row = types.SimpleNamespace(id=42, name="某剧", media_source="themoviedb", media_id="111")
-    SubscribeOper.rows = [row]
-    SubscribeOper.deleted = []
-    SubscribeOper.existing = set()
-
-    from app.chain.subscribe import SubscribeChain
-
-    SubscribeChain.add_calls = []
-    SubscribeChain.add_result = (7, "新增订阅成功")
-
-    instance = MediaAutomatorSync()
-    instance.init_plugin({"enabled": True, "log_path": str(log_file)})
     result = instance.sync()
 
     assert result["success"] is True
@@ -580,14 +624,14 @@ def test_sync_add_and_delete(tmp_path):
 def test_sync_handles_rotation(tmp_path):
     """日志轮转后应从头读取新文件，而不是继续用旧偏移量。"""
     log_file = tmp_path / "app.log"
-    # 首次写入较多内容，使文件明显大于轮转后的新文件。
+    # 先写满一份日志并同步一次，建立偏移量与水位线。
     _write_log(
         log_file,
         [
-            {"timestamp": _ts(5), "message": "订阅成功", "context": {"tmdb_id": 1}},
-            {"timestamp": _ts(5), "message": "无关日志", "context": {}},
-            {"timestamp": _ts(5), "message": "无关日志", "context": {}},
-            {"timestamp": _ts(5), "message": "无关日志", "context": {}},
+            {"timestamp": _ts(120), "message": "服务启动"},
+            {"timestamp": _ts(120), "message": "无关日志", "context": {}},
+            {"timestamp": _ts(120), "message": "无关日志", "context": {}},
+            {"timestamp": _ts(120), "message": "无关日志", "context": {}},
         ],
     )
 
@@ -598,7 +642,8 @@ def test_sync_handles_rotation(tmp_path):
     instance = MediaAutomatorSync()
     instance.init_plugin({"enabled": True, "log_path": str(log_file)})
     first = instance.sync()
-    assert first["added"] == 1
+    # 首次只建立基线，日志里的历史事件一律不执行。
+    assert first["added"] == 0, first
     old_offset = instance._cursor["offset"]
 
     # 模拟轮转：新文件内容更短，偏移量已超出文件大小。
@@ -636,19 +681,9 @@ def test_sync_missing_log_file(tmp_path):
 
 def test_add_failure_falls_back_to_title(tmp_path):
     """TMDB 身份订阅失败时应回退按标题识别。"""
-    log_file = tmp_path / "app.log"
-    _write_log(
-        log_file,
-        [
-            {
-                "timestamp": _ts(5),
-                "message": "订阅成功",
-                "context": {"title": "沙丘2", "tmdb_id": 693134, "type": "movie"},
-            }
-        ],
-    )
-
     from app.chain.subscribe import SubscribeChain
+
+    instance, log_file = _prime_file(tmp_path)
 
     calls = {"n": 0}
 
@@ -664,8 +699,16 @@ def test_add_failure_falls_back_to_title(tmp_path):
     SubscribeChain.add_calls = []
 
     try:
-        instance = MediaAutomatorSync()
-        instance.init_plugin({"enabled": True, "log_path": str(log_file)})
+        _append_log(
+            log_file,
+            [
+                {
+                    "timestamp": _ts(5),
+                    "message": "订阅成功",
+                    "context": {"title": "沙丘2", "tmdb_id": 693134, "type": "movie"},
+                }
+            ],
+        )
         result = instance.sync()
     finally:
         # 还原类属性，避免影响后续用例。
@@ -679,13 +722,9 @@ def test_add_failure_falls_back_to_title(tmp_path):
 
 def test_delete_by_title_when_no_tmdb_id(tmp_path):
     """没有 TMDB ID 时按标题包含匹配删除，与 MA 语义一致。"""
-    log_file = tmp_path / "app.log"
-    _write_log(
-        log_file,
-        [{"timestamp": _ts(5), "message": "已删除订阅：黑袍纠察队"}],
-    )
-
     from app.db.oper.subscribe import SubscribeOper
+
+    instance, log_file = _prime_file(tmp_path)
 
     SubscribeOper.rows = [
         types.SimpleNamespace(id=1, name="黑袍纠察队 第一季"),
@@ -693,8 +732,10 @@ def test_delete_by_title_when_no_tmdb_id(tmp_path):
     ]
     SubscribeOper.deleted = []
 
-    instance = MediaAutomatorSync()
-    instance.init_plugin({"enabled": True, "log_path": str(log_file)})
+    _append_log(
+        log_file,
+        [{"timestamp": _ts(5), "message": "已删除订阅：黑袍纠察队"}],
+    )
     result = instance.sync()
     assert result["deleted"] == 1
     assert SubscribeOper.deleted == [1]
@@ -702,22 +743,216 @@ def test_delete_by_title_when_no_tmdb_id(tmp_path):
 
 def test_sync_respects_toggles(tmp_path):
     """关闭同步开关后对应方向的事件应被跳过。"""
-    log_file = tmp_path / "app.log"
-    _write_log(
+    instance, log_file = _prime_file(
+        tmp_path, sync_add=False, sync_delete=False
+    )
+    _append_log(
         log_file,
         [
             {"timestamp": _ts(5), "message": "订阅成功", "context": {"tmdb_id": 1}},
             {"timestamp": _ts(4), "message": "已删除订阅", "context": {"tmdb_id": 2}},
         ],
     )
-    instance = MediaAutomatorSync()
-    instance.init_plugin(
-        {"enabled": True, "log_path": str(log_file), "sync_add": False, "sync_delete": False}
-    )
     result = instance.sync()
     assert result["added"] == 0
     assert result["deleted"] == 0
     assert result["skipped"] == 2
+
+
+# --------------------------------------------------------------------------
+# 误同步防护（v1.5.0）
+#
+# 线上事故：MA 里只订阅了《女士的法则》，插件首次运行却把最近 30 天日志里的
+# 所有「新增订阅」全部重放了一遍，MoviePilot 里凭空多出整个暮光之城系列。
+# 下面这些用例锁住修复点：首次只建基线、基线可跨重启、水位线挡住陈旧行、
+# 批内去重、脏标题拒收。
+# --------------------------------------------------------------------------
+
+def test_first_run_only_builds_baseline(tmp_path):
+    """首次同步绝不能把日志里的历史订阅当成新事件执行。"""
+    log_file = tmp_path / "app.log"
+    _write_log(
+        log_file,
+        [
+            {
+                "timestamp": _ts(30),
+                "message": "订阅成功",
+                "context": {"title": "暮光之城", "tmdb_id": 111, "type": "movie"},
+            },
+            {
+                "timestamp": _ts(20),
+                "message": "订阅成功",
+                "context": {"title": "暮光之城2：新月", "tmdb_id": 222, "type": "movie"},
+            },
+        ],
+    )
+
+    from app.chain.subscribe import SubscribeChain
+
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_path": str(log_file)})
+    result = instance.sync()
+
+    assert result["success"] is True
+    assert result["added"] == 0
+    assert SubscribeChain.add_calls == [], "历史订阅不应被重放"
+    assert "基线" in result["message"]
+
+
+def test_baseline_survives_reinit(tmp_path):
+    """基线应落盘：宿主重入 init_plugin 后不得重新处理历史事件。"""
+    log_file = tmp_path / "app.log"
+    _write_log(
+        log_file,
+        [
+            {
+                "timestamp": _ts(30),
+                "message": "订阅成功",
+                "context": {"title": "暮光之城", "tmdb_id": 111, "type": "movie"},
+            }
+        ],
+    )
+
+    from app.chain.subscribe import SubscribeChain
+
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_path": str(log_file)})
+    assert instance.sync()["added"] == 0
+
+    # 宿主保存配置时会重建插件实例，游标与水位线必须还在。
+    restarted = MediaAutomatorSync()
+    restarted.init_plugin({"enabled": True, "log_path": str(log_file)})
+    SubscribeChain.add_calls = []
+    again = restarted.sync()
+
+    assert again["added"] == 0
+    assert SubscribeChain.add_calls == []
+
+
+def test_watermark_blocks_stale_lines_after_rotation(tmp_path):
+    """轮转后重扫最近行时，比基线更旧的事件必须被水位线挡住。"""
+    _reset_routes()
+    log_file = tmp_path / "app.log"
+    # 基线文件写厚一点，让下一份更小的日志触发「文件变小 = 轮转」这条路径。
+    _write_log(
+        log_file,
+        [{"timestamp": _ts(300), "message": "服务启动"} for _ in range(7)]
+        + [{"timestamp": _ts(60), "message": "服务启动"}],
+    )
+
+    from app.chain.subscribe import SubscribeChain
+
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_path": str(log_file)})
+    assert instance.sync()["added"] == 0
+
+    # 整份换成「一条比基线更旧的事件 + 一条新事件」，字节数变小触发重扫。
+    _write_log(
+        log_file,
+        [
+            {
+                "timestamp": _ts(120),
+                "message": "订阅成功",
+                "context": {"title": "暮光之城", "tmdb_id": 111, "type": "movie"},
+            },
+            {
+                "timestamp": _ts(2),
+                "message": "订阅成功",
+                "context": {"title": "女士的法则", "tmdb_id": 333, "type": "movie"},
+            },
+        ],
+    )
+    assert log_file.stat().st_size < instance._cursor["offset"]
+    result = instance.sync()
+
+    assert result["stale"] == 1, result
+    assert result["added"] == 1
+    assert [call["media_id"] for call in SubscribeChain.add_calls] == ["333"]
+
+
+def test_duplicate_lines_in_one_batch_are_merged(tmp_path):
+    """MA 为同一次订阅写多行日志，只应产生一次订阅。"""
+    instance, log_file = _prime_file(tmp_path)
+
+    from app.chain.subscribe import SubscribeChain
+
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "新增订阅成功")
+
+    _append_log(
+        log_file,
+        [
+            {
+                "timestamp": _ts(4),
+                "message": "已添加订阅",
+                "context": {"title": "美人余", "tmdb_id": 294446, "type": "movie"},
+            },
+            {
+                "timestamp": _ts(3),
+                "message": "发送消息：title='美人余 (2026) 已添加订阅'",
+            },
+            {"timestamp": _ts(2), "message": "订阅成功：美人余"},
+        ],
+    )
+    result = instance.sync()
+
+    assert result["added"] == 1, result
+    assert result["duplicate"] >= 1
+    assert len(SubscribeChain.add_calls) == 1
+
+
+def test_title_suffix_is_stripped(plugin):
+    """标题里混入的「(2026) 已添加订阅」应被剥掉，只留片名。"""
+    media = plugin._MediaAutomatorSync__extract_media(
+        {"message": "发送消息：title='美人余 (2026) 已添加订阅'", "timestamp": _ts(5)}
+    )
+    assert media["title"] == "美人余"
+
+
+def test_dirty_title_is_rejected(plugin):
+    """抽到的是日志正文而不是片名时必须拒收，不能拿去识别。"""
+    extract = plugin._MediaAutomatorSync__extract_media
+
+    # 结构化文本片段
+    assert extract({"message": "订阅成功：level=INFO title=美人余"})["title"] is None
+    # 超长正文
+    assert extract({"message": "订阅成功：" + "很长的日志正文" * 20})["title"] is None
+    # 纯数字
+    assert extract({"message": "订阅成功：12345"})["title"] is None
+
+
+def test_history_card_shows_source_log_line(tmp_path):
+    """订错片时要能一眼看出是哪一行日志触发的。"""
+    instance, log_file = _prime_file(tmp_path)
+
+    from app.chain.subscribe import SubscribeChain
+
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "新增订阅成功")
+
+    _append_log(
+        log_file,
+        [
+            {
+                "timestamp": _ts(2),
+                "message": "订阅成功",
+                "context": {"title": "女士的法则", "tmdb_id": 294446, "type": "movie"},
+            }
+        ],
+    )
+    assert instance.sync()["added"] == 1
+
+    joined = "\n".join(_collect_texts(instance.get_page()))
+    assert "日志：" in joined, joined
+    assert "女士的法则" in joined
 
 
 def test_invalid_cron_returns_no_service():
@@ -846,25 +1081,36 @@ def test_remote_sync_adds_subscription():
     SubscribeChain.add_calls = []
     SubscribeChain.add_result = (11, "新增订阅成功")
 
+    # 下载端点每次返回整份日志，第一次拉取只用来建立基线。
+    history = [
+        {
+            "timestamp": _ts(60),
+            "message": "订阅成功",
+            "context": {"title": "旧剧", "tmdb_id": 1, "type": "tv"},
+        }
+    ]
     FakeAsyncRequestUtils.routes = {
         "/api/login": FakeResponse(
             200, "", {"access_token": "tok-123"}
         ),
-        "/api/system/logs/download": FakeResponse(
-            200,
-            _log_text(
-                [
-                    {
-                        "timestamp": _ts(3),
-                        "message": "订阅成功",
-                        "context": {"title": "沙丘2", "tmdb_id": 693134, "type": "movie"},
-                    }
-                ]
-            ),
-        ),
+        "/api/system/logs/download": FakeResponse(200, _log_text(history)),
     }
 
     instance = _http_plugin()
+    baseline = instance.sync()
+    assert baseline["added"] == 0, baseline
+
+    # 追加一条新事件后再次同步，才应真正添加订阅。
+    fresh = history + [
+        {
+            "timestamp": _ts(3),
+            "message": "订阅成功",
+            "context": {"title": "沙丘2", "tmdb_id": 693134, "type": "movie"},
+        }
+    ]
+    FakeAsyncRequestUtils.routes["/api/system/logs/download"] = FakeResponse(
+        200, _log_text(fresh)
+    )
     result = instance.sync()
 
     assert result["success"] is True, result
@@ -887,15 +1133,19 @@ def test_remote_sync_does_not_reprocess_same_log():
     SubscribeChain.add_calls = []
     SubscribeChain.add_result = (1, "ok")
 
-    text = _log_text(
-        [{"timestamp": _ts(3), "message": "订阅成功", "context": {"tmdb_id": 111}}]
-    )
+    history = [{"timestamp": _ts(60), "message": "服务启动"}]
     FakeAsyncRequestUtils.routes = {
         "/api/login": FakeResponse(200, "", {"token": "t"}),
-        "/logs/download": FakeResponse(200, text),
+        "/logs/download": FakeResponse(200, _log_text(history)),
     }
 
     instance = _http_plugin()
+    assert instance.sync()["added"] == 0  # 建立基线
+
+    fresh = history + [
+        {"timestamp": _ts(3), "message": "订阅成功", "context": {"tmdb_id": 111}}
+    ]
+    FakeAsyncRequestUtils.routes["/logs/download"] = FakeResponse(200, _log_text(fresh))
     first = instance.sync()
     assert first["added"] == 1
 
@@ -917,17 +1167,17 @@ def test_remote_sync_picks_up_appended_lines():
     SubscribeChain.add_calls = []
     SubscribeChain.add_result = (1, "ok")
 
-    first_records = [{"timestamp": _ts(3), "message": "订阅成功", "context": {"tmdb_id": 1}}]
+    history = [{"timestamp": _ts(60), "message": "服务启动"}]
     FakeAsyncRequestUtils.routes = {
         "/api/login": FakeResponse(200, "", {"token": "t"}),
-        "/logs/download": FakeResponse(200, _log_text(first_records)),
+        "/logs/download": FakeResponse(200, _log_text(history)),
     }
     instance = _http_plugin()
-    assert instance.sync()["added"] == 1
+    assert instance.sync()["added"] == 0  # 建立基线
 
     # 追加一条新记录后重新拉取
-    second_records = first_records + [
-        {"timestamp": _ts(2), "message": "订阅成功", "context": {"tmdb_id": 2}}
+    second_records = history + [
+        {"timestamp": _ts(3), "message": "订阅成功", "context": {"tmdb_id": 2}}
     ]
     FakeAsyncRequestUtils.routes["/logs/download"] = FakeResponse(
         200, _log_text(second_records)
@@ -951,16 +1201,16 @@ def test_remote_sync_handles_log_rotation():
     SubscribeChain.add_calls = []
     SubscribeChain.add_result = (1, "ok")
 
-    many = [{"timestamp": _ts(5), "message": "无关日志", "context": {}} for _ in range(5)]
-    many.append({"timestamp": _ts(4), "message": "订阅成功", "context": {"tmdb_id": 1}})
+    many = [{"timestamp": _ts(120), "message": "无关日志", "context": {}} for _ in range(5)]
+    many.append({"timestamp": _ts(60), "message": "订阅成功", "context": {"tmdb_id": 1}})
     FakeAsyncRequestUtils.routes = {
         "/api/login": FakeResponse(200, "", {"token": "t"}),
         "/logs/download": FakeResponse(200, _log_text(many)),
     }
     instance = _http_plugin()
-    assert instance.sync()["added"] == 1
+    assert instance.sync()["added"] == 0  # 建立基线
 
-    # 日志被清理成只剩两行，含一条新的订阅事件
+    # 日志被清理成只剩一行，含一条新的订阅事件
     rotated = [{"timestamp": _ts(1), "message": "订阅成功", "context": {"tmdb_id": 9}}]
     FakeAsyncRequestUtils.routes["/logs/download"] = FakeResponse(
         200, _log_text(rotated)
@@ -969,6 +1219,41 @@ def test_remote_sync_handles_log_rotation():
     result = instance.sync()
     assert result["added"] == 1
     assert SubscribeChain.add_calls[0]["media_id"] == "9"
+
+
+def test_rotation_without_watermark_only_rebuilds_baseline():
+    """旧版本升级上来时只有行计数、没有水位线，遇到轮转不能重放历史事件。"""
+    _reset_routes()
+    from app.chain.subscribe import SubscribeChain
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.rows = []
+    SubscribeOper.existing = set()
+    SubscribeChain.add_calls = []
+    SubscribeChain.add_result = (1, "ok")
+
+    many = [{"timestamp": _ts(120), "message": "无关日志", "context": {}} for _ in range(5)]
+    many.append({"timestamp": _ts(60), "message": "订阅成功", "context": {"tmdb_id": 1}})
+    FakeAsyncRequestUtils.routes = {
+        "/api/login": FakeResponse(200, "", {"token": "t"}),
+        "/logs/download": FakeResponse(200, _log_text(many)),
+    }
+    instance = _http_plugin()
+    assert instance.sync()["added"] == 0  # 建立基线
+
+    # 模拟从旧版本升级：行计数还在，但水位线这个新字段是空的。
+    instance._watermark = ""
+
+    rotated = [{"timestamp": _ts(30), "message": "订阅成功", "context": {"tmdb_id": 7}}]
+    FakeAsyncRequestUtils.routes["/logs/download"] = FakeResponse(
+        200, _log_text(rotated)
+    )
+    SubscribeChain.add_calls = []
+    result = instance.sync()
+
+    assert result["added"] == 0
+    assert SubscribeChain.add_calls == [], "缺水位线时不得执行任何历史事件"
+    assert "基线" in result["message"]
 
 
 def test_remote_login_discovery_via_openapi():
@@ -982,6 +1267,7 @@ def test_remote_login_discovery_via_openapi():
     SubscribeChain.add_calls = []
     SubscribeChain.add_result = (1, "ok")
 
+    history = [{"timestamp": _ts(60), "message": "服务启动"}]
     FakeAsyncRequestUtils.routes = {
         "openapi.json": FakeResponse(
             200, "", {"paths": {"/api/system/auth/signin": {}, "/api/other": {}}}
@@ -989,11 +1275,15 @@ def test_remote_login_discovery_via_openapi():
         "/api/system/auth/signin": FakeResponse(
             200, "", {"data": {"access_token": "discovered"}}
         ),
-        "/logs/download": FakeResponse(
-            200, _log_text([{"timestamp": _ts(2), "message": "订阅成功", "context": {"tmdb_id": 5}}])
-        ),
+        "/logs/download": FakeResponse(200, _log_text(history)),
     }
     instance = _http_plugin()
+    assert instance.sync()["added"] == 0  # 建立基线
+
+    fresh = history + [
+        {"timestamp": _ts(2), "message": "订阅成功", "context": {"tmdb_id": 5}}
+    ]
+    FakeAsyncRequestUtils.routes["/logs/download"] = FakeResponse(200, _log_text(fresh))
     result = instance.sync()
     assert result["added"] == 1
     # 目标登录端点确实被调用过
@@ -1040,6 +1330,7 @@ def test_remote_sends_cookie_from_set_cookie():
 
     cookie_name = "ma_285446e3"
     cookie_value = '"Bearer eyJhbGciOiJIUzI1NiJ9.fake"'
+    history = [{"timestamp": _ts(60), "message": "服务启动"}]
     FakeAsyncRequestUtils.routes = {
         "/auth/token": FakeResponse(
             200,
@@ -1047,13 +1338,16 @@ def test_remote_sends_cookie_from_set_cookie():
             {"access_token": "tok-abc", "token_type": "bearer"},
             set_cookies=[f"{cookie_name}={cookie_value}; HttpOnly; Max-Age=604800; Path=/; SameSite=lax"],
         ),
-        "/logs/download": FakeResponse(
-            200,
-            _log_text([{"timestamp": _ts(2), "message": "订阅成功", "context": {"tmdb_id": 3}}]),
-        ),
+        "/logs/download": FakeResponse(200, _log_text(history)),
     }
 
     instance = _http_plugin(ma_login_path="/auth/token")
+    assert instance.sync()["added"] == 0  # 建立基线
+
+    fresh = history + [
+        {"timestamp": _ts(2), "message": "订阅成功", "context": {"tmdb_id": 3}}
+    ]
+    FakeAsyncRequestUtils.routes["/logs/download"] = FakeResponse(200, _log_text(fresh))
     result = instance.sync()
     assert result["added"] == 1, result
 
@@ -1083,21 +1377,23 @@ def test_remote_clears_stale_cookie_on_401():
 
     state = {"n": 0}
     cookie_name = "ma_aaaa1111"
+    history = [{"timestamp": _ts(60), "message": "服务启动"}]
+    fresh = history + [
+        {"timestamp": _ts(2), "message": "订阅成功", "context": {"tmdb_id": 8}}
+    ]
 
     class _FlakyUtils(FakeAsyncRequestUtils):
         async def get_res(self, url=None, headers=None, **kwargs):
             FakeAsyncRequestUtils.requests.append(("GET", url, headers))
-            if "logs/download" in (url or ""):
-                state["n"] += 1
-                if state["n"] == 1:
-                    return FakeResponse(401, "")
-                # 第二次必须已经换成新 cookie
-                assert "fresh" in ((headers or {}).get("Cookie") or ""), headers
-                return FakeResponse(
-                    200,
-                    _log_text([{"timestamp": _ts(2), "message": "订阅成功", "context": {"tmdb_id": 8}}]),
-                )
-            return FakeResponse(404, "")
+            if "logs/download" not in (url or ""):
+                return FakeResponse(404, "")
+            state["n"] += 1
+            if state["n"] == 1:
+                return FakeResponse(401, "")
+            # 401 之后的每次请求都必须已经换成重新登录拿到的 cookie
+            assert "fresh" in ((headers or {}).get("Cookie") or ""), headers
+            # 重试那次只建立基线，第二次同步才带回新事件
+            return FakeResponse(200, _log_text(history if state["n"] == 2 else fresh))
 
         async def post_res(self, url=None, headers=None, json=None, data=None, **kwargs):
             FakeAsyncRequestUtils.requests.append(("POST", url, json or data))
@@ -1111,12 +1407,14 @@ def test_remote_clears_stale_cookie_on_401():
     _network_mod.AsyncRequestUtils = _FlakyUtils
     try:
         instance = _http_plugin(ma_login_path="/auth/token")
+        baseline = instance.sync()
+        assert baseline["added"] == 0, baseline
         result = instance.sync()
     finally:
         _network_mod.AsyncRequestUtils = FakeAsyncRequestUtils
 
     assert result["added"] == 1, result
-    assert state["n"] == 2, "应在 401 后重试一次"
+    assert state["n"] == 3, "首次应 401 后重试一次，随后再正常拉取一次"
 
 
 def test_remote_login_uses_form_encoding():
@@ -1165,6 +1463,10 @@ def test_remote_retries_after_401():
 
     # 用一个可变的响应对象模拟「第一次 401，重新登录后成功」
     state = {"count": 0}
+    history = [{"timestamp": _ts(60), "message": "服务启动"}]
+    fresh = history + [
+        {"timestamp": _ts(2), "message": "订阅成功", "context": {"tmdb_id": 7}}
+    ]
 
     class _FlakyUtils(FakeAsyncRequestUtils):
         async def get_res(self, url=None, headers=None, **kwargs):
@@ -1174,8 +1476,7 @@ def test_remote_retries_after_401():
                 if state["count"] == 1:
                     return FakeResponse(401, "")
                 return FakeResponse(
-                    200,
-                    _log_text([{"timestamp": _ts(2), "message": "订阅成功", "context": {"tmdb_id": 7}}]),
+                    200, _log_text(history if state["count"] == 2 else fresh)
                 )
             # openapi 探测不应命中（返回 404 让客户端走内置候选路径）
             return FakeResponse(404, "")
@@ -1188,12 +1489,14 @@ def test_remote_retries_after_401():
     _network_mod.AsyncRequestUtils = _FlakyUtils
     try:
         instance = _http_plugin(ma_token="stale-token")
+        # 第一次同步：401 → 重新登录 → 重试成功，只用来建立基线
+        assert instance.sync()["added"] == 0
         result = instance.sync()
     finally:
         _network_mod.AsyncRequestUtils = FakeAsyncRequestUtils
 
     assert result["added"] == 1, result
-    assert state["count"] == 2, "应在 401 后重试一次"
+    assert state["count"] == 3, "首次应 401 后重试一次，随后再正常拉取一次"
 
 
 # --------------------------------------------------------------------------
@@ -1968,3 +2271,210 @@ def test_reconcile_expands_tv_seasons():
     assert result.success is True, result.message
     seasons = sorted(c.get("season") for c in SubscribeChain.add_calls)
     assert seasons == [1, 2, 3], seasons
+
+
+# --------------------------------------------------------------------------
+# 清理多余订阅
+# --------------------------------------------------------------------------
+
+def _sub(sid, name, media_id=None, username="Media Automator", year=None, season=None):
+    """构造一条订阅行，字段与真实 Subscribe 模型对齐。"""
+    return types.SimpleNamespace(
+        id=sid,
+        name=name,
+        media_id=media_id,
+        username=username,
+        year=year,
+        season=season,
+    )
+
+
+def _purge_plugin(rows):
+    """装好订阅行与 MA 清单路由，返回远程模式插件实例。"""
+    _reset_routes()
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.rows = rows
+    SubscribeOper.deleted = []
+    SubscribeOper.existing = set()
+    FakeAsyncRequestUtils.routes = {
+        "/auth/token": FakeResponse(200, "", {"access_token": "t"}),
+        "/api/subscriptions": FakeResponse(200, "", SUBSCRIPTIONS_PAYLOAD),
+    }
+    return _http_plugin(ma_login_path="/auth/token")
+
+
+def test_purge_dry_run_lists_but_does_not_delete():
+    """预演只列出待清理项，一条都不删。"""
+    from app.db.oper.subscribe import SubscribeOper
+
+    instance = _purge_plugin(
+        [
+            _sub(1, "美人余", media_id="294446", year="2026"),  # MA 里还在
+            _sub(2, "暮光之城"),  # 误同步出来的
+            _sub(3, "女士的法则"),  # 误同步出来的
+        ]
+    )
+    result = instance.api_purge(dry_run=True)
+
+    assert result.success is True, result.message
+    assert "待清理 2 条" in result.message
+    assert SubscribeOper.deleted == [], "预演不应删除任何订阅"
+    assert len(result.data) == 2
+
+
+def test_purge_keeps_subscriptions_still_in_ma():
+    """MA 清单里仍然存在的订阅必须保留，不能被清理掉。"""
+    from app.db.oper.subscribe import SubscribeOper
+
+    instance = _purge_plugin(
+        [
+            _sub(1, "美人余", media_id="294446", year="2026"),
+            _sub(2, "JOJO的奇妙冒险", media_id="45790"),
+            _sub(3, "奥德赛", media_id="1368337"),
+            _sub(4, "暮光之城"),
+        ]
+    )
+    result = instance.api_purge(dry_run=False)
+
+    assert result.success is True, result.message
+    assert SubscribeOper.deleted == [4], SubscribeOper.deleted
+    assert "已清理 1 条" in result.message
+
+
+def test_purge_matches_ma_by_title_when_id_missing():
+    """没有 TMDB ID 的订阅按标题核对，标题在 MA 清单里就保留。"""
+    from app.db.oper.subscribe import SubscribeOper
+
+    instance = _purge_plugin([_sub(1, "美人余"), _sub(2, "不存在的剧")])
+    instance.api_purge(dry_run=False)
+
+    assert SubscribeOper.deleted == [2], SubscribeOper.deleted
+
+
+def test_purge_never_touches_user_created_subscriptions():
+    """只清理插件建的订阅，用户自己手动建的订阅一律不碰。"""
+    from app.db.oper.subscribe import SubscribeOper
+
+    instance = _purge_plugin(
+        [
+            _sub(1, "用户自己订的剧", username=None),
+            _sub(2, "用户用别的用户名订的剧", username="someone"),
+            _sub(3, "误同步出来的剧"),
+        ]
+    )
+    instance.api_purge(dry_run=False)
+
+    assert SubscribeOper.deleted == [3], SubscribeOper.deleted
+
+
+def test_purge_filters_by_title_keywords():
+    """titles 参数只清理命中的标题，其余保留。"""
+    from app.db.oper.subscribe import SubscribeOper
+
+    instance = _purge_plugin(
+        [
+            _sub(1, "暮光之城"),
+            _sub(2, "暮光之城2：新月"),
+            _sub(3, "女士的法则"),
+        ]
+    )
+    result = instance.api_purge(dry_run=False, titles="暮光之城")
+
+    assert SubscribeOper.deleted == [1, 2], SubscribeOper.deleted
+    assert "已清理 2 条" in result.message
+
+
+def test_purge_accepts_full_width_comma_in_titles():
+    """中文逗号分隔的关键字同样生效。"""
+    from app.db.oper.subscribe import SubscribeOper
+
+    instance = _purge_plugin(
+        [_sub(1, "暮光之城"), _sub(2, "女士的法则"), _sub(3, "别的剧")]
+    )
+    instance.api_purge(dry_run=False, titles="暮光之城，女士的法则")
+
+    assert sorted(SubscribeOper.deleted) == [1, 2], SubscribeOper.deleted
+
+
+def test_purge_requires_http_mode_when_checking_ma():
+    """文件模式拿不到 MA 清单，核对模式下必须拒绝执行而不是盲删。"""
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.rows = [_sub(1, "某剧")]
+    SubscribeOper.deleted = []
+
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_source": "file", "log_path": "x.log"})
+    result = instance.api_purge(dry_run=False, keep_ma=True)
+
+    assert result.success is False
+    assert "远程 HTTP" in result.message
+    assert SubscribeOper.deleted == [], "核对不可用时应拒绝删除"
+
+
+def test_purge_allows_explicit_no_cross_check_in_file_mode():
+    """显式关闭核对时，文件模式也能按用户名清理。"""
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.rows = [_sub(1, "某剧"), _sub(2, "用户剧", username=None)]
+    SubscribeOper.deleted = []
+
+    instance = MediaAutomatorSync()
+    instance.init_plugin({"enabled": True, "log_source": "file", "log_path": "x.log"})
+    result = instance.api_purge(dry_run=False, keep_ma=False)
+
+    assert result.success is True, result.message
+    assert SubscribeOper.deleted == [1], SubscribeOper.deleted
+
+
+def test_purge_aborts_when_ma_unreachable():
+    """拉不到 MA 清单时必须中止，不能当成「MA 里都没有」而全删。"""
+    _reset_routes()
+    from app.db.oper.subscribe import SubscribeOper
+
+    SubscribeOper.rows = [_sub(1, "某剧")]
+    SubscribeOper.deleted = []
+
+    instance = _http_plugin(ma_login_path="/auth/token")
+    result = instance.api_purge(dry_run=False)
+
+    assert result.success is False
+    assert SubscribeOper.deleted == [], "清单拉取失败时不应删除"
+
+
+def test_purge_result_is_visible_after_page_reload():
+    """接口返回值不会被详情页渲染，结果必须落盘才能在页面上看到。"""
+    instance = _purge_plugin([_sub(1, "暮光之城"), _sub(2, "美人余", media_id="294446")])
+    instance.api_purge(dry_run=True)
+
+    last_action = instance.get_data("last_action")
+    assert last_action is not None
+    assert last_action["title"] == "清理本插件订阅（预演）"
+    assert any("暮光之城" in line for line in last_action["details"])
+
+
+def test_page_exposes_purge_buttons():
+    """详情页要有清理按钮，且预演与删除走同一个端点、参数不同。"""
+    instance = _purge_plugin([])
+    buttons = _collect_buttons(instance.get_page())
+    purge_buttons = [
+        b for b in buttons
+        if ((b.get("events") or {}).get("click") or {}).get("api")
+        == "plugin/MediaAutomatorSync/purge"
+    ]
+    assert len(purge_buttons) == 2, [b.get("text") for b in purge_buttons]
+    params = [
+        ((b["events"]["click"].get("params")) or {}).get("dry_run")
+        for b in purge_buttons
+    ]
+    assert sorted(params, key=str) == [False, True], params
+
+
+def test_purge_describes_season_in_details():
+    """多季订阅在明细里要标出季号，便于用户确认删的是哪一条。"""
+    instance = _purge_plugin([_sub(1, "某剧", season=2, year="2024")])
+    result = instance.api_purge(dry_run=True)
+
+    assert "第 2 季" in result.data[0]
+

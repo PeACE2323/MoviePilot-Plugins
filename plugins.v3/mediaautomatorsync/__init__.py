@@ -78,6 +78,18 @@ COLON_TITLE_RE = re.compile(
     r"删除订阅|已删除订阅|取消订阅|移除订阅|订阅已删除)"
     r"\s*[：:\-—]\s*(.+)"
 )
+# 标题长度上限。真实影视标题极少超过这个长度，超出的基本都是把整行日志
+# 当成标题抓下来了，必须拒收，否则会拿着一段日志去 MoviePilot 里做识别。
+MAX_TITLE_LENGTH = 80
+# 标题尾部常见的事件后缀，例如「美人余 (2026) 已添加订阅」「沙丘2 订阅成功」。
+# 从日志的「发送消息」行提取标题时容易把这些后缀一起带走，需要在入库前剥掉。
+TITLE_SUFFIX_RE = re.compile(
+    r"\s*[（(]?\s*(?:19|20)\d{2}\s*[）)]?\s*"
+    r"(?:已添加订阅|已删除订阅|订阅成功|订阅失败|新增订阅|删除订阅|"
+    r"已创建订阅|订阅已创建|已订阅|已取消订阅|取消订阅)\s*$"
+)
+# 出现在标题里就说明这根本不是标题，而是日志正文片段。
+TITLE_REJECT_RE = re.compile(r"[{}\[\]<>]|=\s*\w+|\b(?:level|logger|trace_id|event_type)\b")
 # 常见标题字段名，用于从 context 字典里直接取值。
 TITLE_KEYS = ("title", "name", "media_title", "title_year", "show_name", "subject")
 # 常见媒体类型字段名。
@@ -86,6 +98,11 @@ TYPE_KEYS = ("type", "media_type", "mtype")
 TMDB_KEYS = ("tmdb_id", "tmdbid", "tmdb")
 # 常见年份字段名。
 YEAR_KEYS = ("year", "release_year", "first_air_date")
+
+# 本插件在 MoviePilot 上创建订阅时使用的订阅用户。
+# 它是区分「插件建的订阅」与「用户手动建的订阅」的唯一可靠标记，
+# 清理、统计、查重都依赖它，因此收敛成一个常量而不是散落成字面量。
+SUBSCRIBE_OWNER = "Media Automator"
 
 
 class MediaAutomatorSync(_PluginBase):
@@ -98,7 +115,7 @@ class MediaAutomatorSync(_PluginBase):
     # 插件图标
     plugin_icon = "MediaAutomator_A.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.5.0"
     # 插件作者
     plugin_author = "PeACE2323"
     # 作者主页
@@ -145,6 +162,10 @@ class MediaAutomatorSync(_PluginBase):
         # 运行时状态
         self._cursor: Dict[str, Any] = {}
         self._http_state: Dict[str, Any] = {}
+        # 已处理事件的时间水位线（ISO 字符串）。日志被轮转、状态被重置或接口
+        # 重复返回整份文件时，只有晚于这条水位线的事件才会被执行，避免把历史上
+        # 早已处理过的订阅重新灌进 MoviePilot。
+        self._watermark: str = ""
         self._history: List[Dict[str, Any]] = []
         self._last_error: str = ""
         self._last_run: str = ""
@@ -192,6 +213,7 @@ class MediaAutomatorSync(_PluginBase):
         # 读取持久化的读取位置、行指纹与处理历史。
         self._cursor = self.get_data("cursor") or {}
         self._http_state = self.get_data("http_state") or {}
+        self._watermark = str(self.get_data("watermark") or "")
         self._history = self.get_data("history") or []
         self._last_action = self.get_data("last_action") or {}
         if not isinstance(self._cursor, dict):
@@ -270,6 +292,14 @@ class MediaAutomatorSync(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "查缺补漏：补齐 MoviePilot 缺少的订阅",
+                "response_model": schemas.Response,
+            },
+            {
+                "path": "/purge",
+                "endpoint": self.api_purge,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "清理本插件创建的多余订阅",
                 "response_model": schemas.Response,
             },
             {
@@ -857,6 +887,81 @@ class MediaAutomatorSync(_PluginBase):
                 }
             )
 
+        # 清理：把本插件建过、但 Media Automator 上已经不存在的订阅摘掉。
+        # 只动 username 为 SUBSCRIBE_OWNER 的订阅，用户手动建的订阅不受影响。
+        contents.append(
+            {
+                "component": "VRow",
+                "props": {"class": "mb-2"},
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "color": "warning",
+                                    "variant": "tonal",
+                                    "block": True,
+                                    "prepend-icon": "mdi-delete-sweep-outline",
+                                },
+                                "text": "清理多余订阅（预演）",
+                                "events": {
+                                    "click": {
+                                        "api": "plugin/MediaAutomatorSync/purge",
+                                        "method": "get",
+                                        "params": {"dry_run": True},
+                                    }
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "color": "error",
+                                    "variant": "flat",
+                                    "block": True,
+                                    "prepend-icon": "mdi-delete-alert-outline",
+                                },
+                                "text": "清理多余订阅（删除）",
+                                "events": {
+                                    "click": {
+                                        "api": "plugin/MediaAutomatorSync/purge",
+                                        "method": "get",
+                                        "params": {"dry_run": False},
+                                    }
+                                },
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+        contents.append(
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "warning",
+                    "variant": "tonal",
+                    "density": "compact",
+                    "class": "mb-2",
+                    "text": (
+                        "「清理」只删除本插件创建的订阅（订阅用户为 "
+                        f"{SUBSCRIBE_OWNER}），并保留 Media Automator 上仍然存在的那些，"
+                        "所以能安全地摘掉历史日志误同步出来的订阅。"
+                        "执行前请先点「预演」确认名单。"
+                        "只想清掉某几部时，可在地址栏调用 /purge?dry_run=false&titles=暮光之城"
+                    ),
+                },
+            }
+        )
+
         # 最近一次手动操作的结果。
         # 详情页按钮的机制是「调接口 → 重新加载页面数据」，接口返回值不会被渲染，
         # 所以这里把结果读出来展示，否则用户点击后只会看到进度条闪一下就消失。
@@ -941,30 +1046,45 @@ class MediaAutomatorSync(_PluginBase):
             else:
                 action_text, color = "已跳过", "grey"
 
+            card: List[Dict[str, Any]] = [
+                {
+                    "component": "VCardText",
+                    "props": {"class": "pa-2"},
+                    "text": (
+                        f"[{action_text}] {item.get('title') or '未知标题'}"
+                        f"（{item.get('year') or '未知年份'}）"
+                    ),
+                },
+                {
+                    "component": "VCardText",
+                    "props": {"class": "pa-2 text-caption"},
+                    "text": (
+                        f"媒体来源：{item.get('media_source') or '-'} / "
+                        f"{item.get('media_id') or '-'}　"
+                        f"结果：{item.get('message') or '-'}　"
+                        f"时间：{item.get('time') or '-'}"
+                    ),
+                },
+            ]
+            # 附上触发这条记录的日志原文：订错片时能一眼看出是哪一行导致的。
+            raw = str(item.get("raw") or "").strip()
+            if raw:
+                card.append(
+                    {
+                        "component": "VCardText",
+                        "props": {
+                            "class": "pa-2 pt-0 text-caption text-medium-emphasis",
+                            "style": "word-break: break-all; font-family: monospace;",
+                        },
+                        "text": f"日志：{raw}",
+                    }
+                )
+
             contents.append(
                 {
                     "component": "VCard",
                     "props": {"variant": "tonal", "color": color},
-                    "content": [
-                        {
-                            "component": "VCardText",
-                            "props": {"class": "pa-2"},
-                            "text": (
-                                f"[{action_text}] {item.get('title') or '未知标题'}"
-                                f"（{item.get('year') or '未知年份'}）"
-                            ),
-                        },
-                        {
-                            "component": "VCardText",
-                            "props": {"class": "pa-2 text-caption"},
-                            "text": (
-                                f"媒体来源：{item.get('media_source') or '-'} / "
-                                f"{item.get('media_id') or '-'}　"
-                                f"结果：{item.get('message') or '-'}　"
-                                f"时间：{item.get('time') or '-'}"
-                            ),
-                        },
-                    ],
+                    "content": card,
                 }
             )
         return contents
@@ -1211,6 +1331,115 @@ class MediaAutomatorSync(_PluginBase):
             data=planned if dry_run else details,
         )
 
+    def api_purge(
+        self,
+        dry_run: bool = True,
+        titles: str = "",
+        keep_ma: bool = True,
+    ) -> schemas.Response:
+        """
+        清理本插件在 MoviePilot 上创建的订阅。
+
+        只处理 ``username == SUBSCRIBE_OWNER`` 的订阅，用户自己手动建的订阅不会被动到。
+        默认还会与 Media Automator 的订阅清单核对，保留「MA 上仍然存在」的那些，
+        只摘掉多余项——这正是日志重放事故之后该做的事：清掉误灌进来的历史订阅，
+        同时不误伤当前真实订阅。
+
+        :param dry_run: 为真时只列出将要删除的订阅，不实际删除
+        :param titles: 逗号分隔的标题关键字；非空时只清理名称命中关键字的订阅
+        :param keep_ma: 为真时保留 Media Automator 上仍然存在的订阅，只清理多余项
+        :return: 统计结果
+        """
+        keywords = [
+            item.strip().lower()
+            for item in re.split(r"[,，]", titles or "")
+            if item.strip()
+        ]
+
+        # 交叉核对要读订阅清单接口，文件模式拿不到；删除不可逆，缺信息时宁可停下。
+        if keep_ma and self._log_source != LOG_SOURCE_HTTP:
+            message = (
+                "清理订阅需要与 Media Automator 清单核对，请把日志来源切到「远程 HTTP」，"
+                "或显式关闭「与 MA 清单核对」再执行"
+            )
+            self.__record_action("清理本插件订阅", message)
+            return schemas.Response(success=False, message=message)
+
+        try:
+            subscriptions = SubscribeOper().list_by_username(SUBSCRIBE_OWNER) or []
+        except Exception as error:
+            message = f"读取 MoviePilot 订阅失败：{error}"
+            self.__record_action("清理本插件订阅", message)
+            return schemas.Response(success=False, message=message)
+
+        ma_ids: set = set()
+        ma_titles: set = set()
+        if keep_ma:
+            client = self.__get_client()
+            records = self.__run_async(client.fetch_subscriptions())
+            if records is None:
+                message = (
+                    "拉取 Media Automator 订阅清单失败，已中止清理："
+                    f"{client.last_error or '未知原因'}"
+                )
+                self.__record_action("清理本插件订阅", message)
+                return schemas.Response(success=False, message=message)
+            for item in records:
+                if item.get("tmdb_id"):
+                    ma_ids.add(str(item["tmdb_id"]))
+                if item.get("title"):
+                    ma_titles.add(str(item["title"]).strip().lower())
+
+        targets: List[Any] = []
+        for subscribe in subscriptions:
+            name = str(getattr(subscribe, "name", "") or "")
+            media_id = str(getattr(subscribe, "media_id", "") or "")
+            if keywords and not any(word in name.lower() for word in keywords):
+                continue
+            if keep_ma and (media_id in ma_ids or name.strip().lower() in ma_titles):
+                # MA 清单里还有这条，属于正常同步结果，保留。
+                continue
+            targets.append(subscribe)
+
+        details = [self.__describe_subscribe(subscribe) for subscribe in targets]
+        total = len(subscriptions)
+
+        if dry_run:
+            summary = f"本插件共建 {total} 条订阅，待清理 {len(targets)} 条（预演，未删除）"
+            self.__record_action("清理本插件订阅（预演）", summary, details)
+            return schemas.Response(success=True, message=summary, data=details)
+
+        removed = 0
+        failed = 0
+        for subscribe in targets:
+            sid = getattr(subscribe, "id", None)
+            if not sid:
+                continue
+            try:
+                SubscribeOper().delete(int(sid))
+            except Exception as error:  # 单条失败不影响其余条目
+                failed += 1
+                logger.error(
+                    f"Media Automator 清理订阅：删除 {sid} 失败：{error}",
+                    exc_info=True,
+                )
+                continue
+            removed += 1
+
+        summary = f"本插件共建 {total} 条订阅，已清理 {removed} 条，失败 {failed} 条"
+        logger.info(f"Media Automator 清理订阅完成：{summary}")
+        self.__record_action("清理本插件订阅", summary, details)
+        return schemas.Response(success=not failed, message=summary, data=details)
+
+    @staticmethod
+    def __describe_subscribe(subscribe: Any) -> str:
+        """把一条订阅压成详情页可读的一行：标题（年份，第 N 季）。"""
+        name = str(getattr(subscribe, "name", "") or "未知标题")
+        year = getattr(subscribe, "year", None) or "未知年份"
+        season = getattr(subscribe, "season", None)
+        suffix = f"，第 {season} 季" if season is not None else ""
+        return f"{name}（{year}{suffix}）"
+
     def api_reset(self) -> schemas.Response:
         """清空读取位置、远程行指纹与同步历史。"""
         with self._state_lock:
@@ -1290,6 +1519,8 @@ class MediaAutomatorSync(_PluginBase):
             "deleted": 0,
             "skipped": 0,
             "failed": 0,
+            "stale": 0,
+            "duplicate": 0,
         }
 
         if not self._enabled:
@@ -1309,8 +1540,32 @@ class MediaAutomatorSync(_PluginBase):
 
         self._last_error = ""
         # 下载端点返回整份文件，因此这里做行级去重而不是字节偏移。
-        lines, new_state = self.__diff_remote_lines(text)
+        lines, new_state, mode = self.__diff_remote_lines(text)
         result["scanned"] = len(lines)
+
+        # 只有水位线可信时才允许执行。首次运行、以及「有行计数却没有水位线」
+        # （从没有水位线的旧版本升级上来）都只建基线：这两种情况都无法区分
+        # 哪些是历史事件、哪些是新事件，宁可漏一轮也不能把历史订阅重放一遍。
+        baseline_only = mode == "first" or (mode == "rotation" and not self._watermark)
+        if baseline_only:
+            # 只建立基线：把水位线定在日志里最新的事件时间，之后只同步
+            # 晚于它的事件。否则历史日志里所有「新增订阅」都会被重新执行一遍。
+            self._watermark = self.__newest_timestamp(text) or self.__now_text()
+            self._http_state = new_state
+            self.__persist_state()
+            if mode == "first":
+                result["message"] = (
+                    f"首次运行：已建立日志基线（共 {new_state['last_count']} 行），"
+                    "本次不执行任何历史订阅；之后的新增订阅才会同步"
+                )
+            else:
+                result["message"] = (
+                    "日志已轮转且缺少时间水位线（多为从旧版本升级），"
+                    "本次只重建基线，不执行历史订阅"
+                )
+            logger.info(f"Media Automator 订阅同步：{result['message']}")
+            self.__record_action("建立基线", result["message"])
+            return result
 
         self.__process_lines(lines, result)
 
@@ -1323,33 +1578,39 @@ class MediaAutomatorSync(_PluginBase):
             self.__notify_result(result)
         return result
 
-    def __diff_remote_lines(self, text: str) -> Tuple[List[str], Dict[str, Any]]:
+    def __diff_remote_lines(self, text: str) -> Tuple[List[str], Dict[str, Any], str]:
         """
         从整份日志文本中挑出尚未处理过的行。
 
-        接口每次返回全部内容，所以用「上一批最后一行的指纹 + 行数」定位新增区段：
-        正常情况下新内容是追加的，直接取旧行数之后的部分；若日志被轮转或清理导致
-        行数减少、或末尾指纹不匹配，则退化为只保留最近 ``max_lines`` 行。
+        接口每次返回全部内容，所以用「上一批最后一行的指纹 + 行数」定位新增区段。
+        返回的第三个值是本次读取的模式：
+
+        * ``append``：正常追加，只处理旧行数之后的部分；
+        * ``first``：还没有任何基线，**不执行任何历史事件**，只记录位置；
+        * ``rotation``：日志被轮转或改写，行数与指纹都对不上，退回「最近 N 行」，
+          但执行阶段仍会被时间水位线挡住，不会把历史订阅重放一遍。
         """
         all_lines = [line for line in text.splitlines() if line.strip()]
         last_fingerprint = str(self._http_state.get("last_fingerprint") or "")
         last_count = int(self._http_state.get("last_count") or 0)
 
         new_lines: List[str] = []
-        if last_count and last_count <= len(all_lines):
-            # 校验旧批次的末尾是否仍然对得上，对得上才是纯追加。
-            if not last_fingerprint or self.__line_fingerprint(all_lines[last_count - 1]) == last_fingerprint:
-                new_lines = all_lines[last_count:]
-            else:
-                logger.info("Media Automator 远程日志：末尾指纹不匹配（可能被轮转），按最近行处理")
-                new_lines = all_lines[-self._max_lines:]
-        elif last_count:
+        if not last_count:
+            # 首次运行：只建立基线。历史日志里可能有大量早已处理过、甚至早已被
+            # 用户删掉的订阅，重放它们会把 MoviePilot 灌满用户根本没要的订阅。
+            mode = "first"
+        elif last_count > len(all_lines):
             # 行数变少说明日志被轮转或清理了。
             logger.info("Media Automator 远程日志：行数减少（日志已轮转），按最近行处理")
+            mode = "rotation"
+            new_lines = all_lines[-self._max_lines:]
+        elif last_fingerprint and self.__line_fingerprint(all_lines[last_count - 1]) != last_fingerprint:
+            logger.info("Media Automator 远程日志：末尾指纹不匹配（可能被轮转），按最近行处理")
+            mode = "rotation"
             new_lines = all_lines[-self._max_lines:]
         else:
-            # 首次运行：只取最近若干行，避免把历史订阅一次性灌进 MoviePilot。
-            new_lines = all_lines[-self._max_lines:]
+            mode = "append"
+            new_lines = all_lines[last_count:]
 
         # 单次处理上限，防止一次导入过多。
         if len(new_lines) > self._max_lines:
@@ -1360,7 +1621,7 @@ class MediaAutomatorSync(_PluginBase):
             "last_fingerprint": self.__line_fingerprint(all_lines[-1]) if all_lines else "",
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
-        return new_lines, state
+        return new_lines, state, mode
 
     @staticmethod
     def __line_fingerprint(line: str) -> str:
@@ -1381,6 +1642,8 @@ class MediaAutomatorSync(_PluginBase):
             "deleted": 0,
             "skipped": 0,
             "failed": 0,
+            "stale": 0,
+            "duplicate": 0,
         }
 
         # 未启用时直接返回，避免手动 API 绕过开关执行同步。
@@ -1390,7 +1653,7 @@ class MediaAutomatorSync(_PluginBase):
             return result
 
         try:
-            lines, new_cursor = self.__read_new_lines()
+            lines, new_cursor, mode = self.__read_new_lines()
         except FileNotFoundError:
             self._last_error = f"日志文件不存在：{self._log_path}"
             result["success"] = False
@@ -1407,6 +1670,32 @@ class MediaAutomatorSync(_PluginBase):
             return result
 
         self._last_error = ""
+
+        # 与远程模式同一套判断：无法确认水位线时只建基线，不执行历史事件。
+        baseline_only = mode == "first" or (mode == "rotation" and not self._watermark)
+        if baseline_only:
+            # 首次运行只建立基线：把水位线定在日志里最新的事件时间。
+            try:
+                tail = self.__read_tail_lines(self._log_path, 200)
+            except (OSError, ValueError):
+                tail = []
+            self._watermark = self.__newest_timestamp("\n".join(tail)) or self.__now_text()
+            with self._state_lock:
+                self._cursor = new_cursor
+                self.__persist_state()
+            if mode == "first":
+                result["message"] = (
+                    "首次运行：已建立日志基线，本次不执行任何历史订阅；之后的新增订阅才会同步"
+                )
+            else:
+                result["message"] = (
+                    "日志已轮转且缺少时间水位线（多为从旧版本升级），"
+                    "本次只重建基线，不执行历史订阅"
+                )
+            logger.info(f"Media Automator 订阅同步：{result['message']}")
+            self.__record_action("建立基线", result["message"])
+            return result
+
         result["scanned"] = len(lines)
 
         self.__process_lines(lines, result)
@@ -1426,19 +1715,41 @@ class MediaAutomatorSync(_PluginBase):
     @staticmethod
     def __format_result(result: Dict[str, Any]) -> str:
         """把统计结果格式化为一行说明。"""
-        return (
-            f"扫描 {result['scanned']} 行，新增订阅 {result['added']} 条，"
-            f"删除订阅 {result['deleted']} 条，跳过 {result['skipped']} 条，"
-            f"失败 {result['failed']} 条"
-        )
+        parts = [
+            f"扫描 {result['scanned']} 行",
+            f"新增订阅 {result['added']} 条",
+            f"删除订阅 {result['deleted']} 条",
+            f"跳过 {result['skipped']} 条",
+        ]
+        # 这两个计数只在确实发生时展示，平时不占版面。
+        if result.get("stale"):
+            parts.append(f"历史事件已忽略 {result['stale']} 条")
+        if result.get("duplicate"):
+            parts.append(f"重复行已合并 {result['duplicate']} 条")
+        parts.append(f"失败 {result['failed']} 条")
+        return "，".join(parts)
 
     def __process_lines(self, lines: List[str], result: Dict[str, Any]) -> None:
         """逐行解析并执行订阅同步，就地更新统计。"""
+        # 时间水位线：只执行晚于上次已处理事件时间的记录。日志轮转、状态重置或
+        # 接口重复返回整份文件时，历史订阅会被重新读到，水位线负责把它们挡掉。
+        # 水位线取自 Media Automator 自己写的时间戳，因此不依赖两边容器时区一致。
+        watermark = self.__parse_timestamp(self._watermark)
+        newest = watermark
+        seen: set = set()
+
         # 按时间顺序处理，保证新增先于删除的因果顺序不被破坏。
         for raw in lines:
             record = self.__parse_log_line(raw)
             if record is None:
                 continue
+            timestamp = self.__parse_timestamp(record.get("timestamp"))
+            if timestamp and (newest is None or timestamp > newest):
+                newest = timestamp
+            if watermark and timestamp and timestamp < watermark:
+                result["stale"] += 1
+                continue
+
             action = self.__classify(record)
             if not action:
                 continue
@@ -1454,6 +1765,14 @@ class MediaAutomatorSync(_PluginBase):
                 result["skipped"] += 1
                 continue
 
+            # 同一条订阅在 Media Automator 日志里通常对应多行（创建、发通知、
+            # 排程搜索），批内去重保证一轮里只处理一次。
+            key = self.__dedup_key(action, media)
+            if key in seen:
+                result["duplicate"] += 1
+                continue
+            seen.add(key)
+
             try:
                 if action == "add":
                     outcome = self.__apply_add(media, record)
@@ -1465,7 +1784,7 @@ class MediaAutomatorSync(_PluginBase):
                     exc_info=True,
                 )
                 result["failed"] += 1
-                self.__record_history(action, media, f"处理失败：{error}")
+                self.__record_history(action, media, f"处理失败：{error}", raw)
                 continue
 
             if outcome.get("changed"):
@@ -1475,7 +1794,32 @@ class MediaAutomatorSync(_PluginBase):
                     result["deleted"] += 1
             else:
                 result["skipped"] += 1
-            self.__record_history(action, media, outcome.get("message") or "")
+            self.__record_history(action, media, outcome.get("message") or "", raw)
+
+        # 水位线只前进不后退；批内没有任何可用时间戳时保持不变。
+        if newest and (watermark is None or newest > watermark):
+            self._watermark = newest.strftime("%Y-%m-%d %H:%M:%S,%f")
+
+    @staticmethod
+    def __dedup_key(action: str, media: Dict[str, Any]) -> str:
+        """
+        生成批内去重用的键。
+
+        这里**优先用标题**而不是 TMDB ID，原因是 Media Automator 为同一次订阅会写
+        多行日志，其中往往只有一行带结构化 ``context.tmdb_id``，其余（例如
+        ``发送消息：{... title='美人余 (2026) 已添加订阅' ...}``）只能从文本里抽标题。
+        若优先按 ID 去重，这两行会得到不同的键，同一次订阅就会被执行两次——这正是
+        线上出现「已添加订阅」紧接着「订阅已存在」的原因。标题能把这类多行日志合并
+        成一次操作。
+        """
+        title = str(media.get("title") or "").strip().lower()
+        if title:
+            # 刻意不把年份算进键里：同一次订阅的多行日志里，往往只有一行能抽到
+            # 年份（例如从「美人余 (2026) 已添加订阅」里带出来），带上年份会让
+            # 同一次订阅得到两个不同的键，去重就失效了。同一批日志里出现同名但
+            # 不同年的两部作品，实际不会发生。
+            return f"{action}:title:{title}"
+        return f"{action}:tmdb:{media.get('media_id')}"
 
     def __best_version_kwargs(self) -> Dict[str, Any]:
         """
@@ -1576,7 +1920,7 @@ class MediaAutomatorSync(_PluginBase):
             mtype=mtype,
             media_source=MediaSource.TMDB if media_id else None,
             media_id=str(media_id) if media_id else None,
-            username="Media Automator",
+            username=SUBSCRIBE_OWNER,
             exist_ok=True,
             **self.__best_version_kwargs(),
         )
@@ -1589,7 +1933,7 @@ class MediaAutomatorSync(_PluginBase):
                 title=title,
                 year=year,
                 mtype=mtype,
-                username="Media Automator",
+                username=SUBSCRIBE_OWNER,
                 exist_ok=True,
                 **self.__best_version_kwargs(),
             )
@@ -1637,7 +1981,7 @@ class MediaAutomatorSync(_PluginBase):
                 media_source=MediaSource.TMDB,
                 media_id=media_id,
                 season=season,
-                username="Media Automator",
+                username=SUBSCRIBE_OWNER,
                 exist_ok=True,
                 **self.__best_version_kwargs(),
             )
@@ -1735,11 +2079,14 @@ class MediaAutomatorSync(_PluginBase):
     # 日志读取与解析
     # ------------------------------------------------------------------
 
-    def __read_new_lines(self) -> Tuple[List[str], Dict[str, Any]]:
+    def __read_new_lines(self) -> Tuple[List[str], Dict[str, Any], str]:
         """
         从上次位置增量读取日志行。
 
-        :return: (新增的文本行, 新的游标)
+        第三个返回值是读取模式：``first``（首次运行，只建基线）、``rotation``
+        （日志被轮转，按最近行重新对齐）、``append``（正常追加）。
+
+        :return: (新增的文本行, 新的游标, 读取模式)
         :raises FileNotFoundError: 日志文件不存在
         :raises OSError: 文件读取失败
         :raises ValueError: 配置无效
@@ -1757,20 +2104,29 @@ class MediaAutomatorSync(_PluginBase):
         offset = int(self._cursor.get("offset") or 0)
         stored_identity = self._cursor.get("identity")
 
-        # 文件被轮转或替换时 inode/size 会变化，此时从头读取新文件。
-        if stored_identity and stored_identity != identity:
-            logger.info("Media Automator 订阅同步：检测到日志轮转，从新文件开头读取")
+        if not stored_identity and not offset:
+            # 首次运行：直接跳到文件末尾建立基线，不执行任何历史订阅。
+            mode = "first"
+            offset = stat.st_size
+        elif stored_identity and stored_identity != identity:
+            # 文件被轮转或替换：从新文件开头读，但只保留最近若干行，
+            # 执行阶段还会被时间水位线挡掉历史事件。
+            logger.info("Media Automator 订阅同步：检测到日志轮转，按最近行重新对齐")
+            mode = "rotation"
             offset = 0
-        if offset > stat.st_size:
-            logger.info("Media Automator 订阅同步：日志文件变小，判定为轮转，重新从头读取")
+        elif offset > stat.st_size:
+            logger.info("Media Automator 订阅同步：日志文件变小，判定为轮转，按最近行重新对齐")
+            mode = "rotation"
             offset = 0
+        else:
+            mode = "append"
 
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             handle.seek(offset)
             raw_lines = handle.readlines()
             new_offset = handle.tell()
 
-        # 限制单次处理量，避免一次导入巨量历史日志把宿主拖慢。
+        # 轮转后可能一口气读到整个新文件，只取末尾，避免一次导入巨量历史日志。
         truncated = False
         if len(raw_lines) > self._max_lines:
             raw_lines = raw_lines[-self._max_lines:]
@@ -1784,7 +2140,7 @@ class MediaAutomatorSync(_PluginBase):
             "truncated": truncated,
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
-        return lines, cursor
+        return lines, cursor, mode
 
     @staticmethod
     def __read_tail_lines(log_path: str, limit: int) -> List[str]:
@@ -1958,6 +2314,8 @@ class MediaAutomatorSync(_PluginBase):
                 raw_type = value.strip()
                 break
 
+        title = self.__clean_title(title)
+
         return {
             "media_source": MediaSource.TMDB.value if media_id else None,
             "media_id": media_id,
@@ -1965,6 +2323,40 @@ class MediaAutomatorSync(_PluginBase):
             "year": year,
             "raw_type": raw_type,
         }
+
+    @staticmethod
+    def __clean_title(title: Optional[str]) -> Optional[str]:
+        """
+        清洗从日志里抓到的标题。
+
+        从「发送消息」类日志行里抓标题时，很容易把事件后缀、引号或整行日志一起
+        带进来。带着这种脏标题去 MoviePilot 识别，就会订到完全不相关的片子，
+        所以这里宁可返回 None（跳过这条）也不要放行可疑值。
+        """
+        if not title:
+            return None
+        candidate = str(title).strip()
+        # 换行、制表符说明抓到的是日志正文而不是标题。
+        if any(ch in candidate for ch in ("\n", "\r", "\t")):
+            return None
+        # 剥掉「(2026) 已添加订阅」这类事件后缀，可能叠加多层。
+        for _ in range(3):
+            stripped = TITLE_SUFFIX_RE.sub("", candidate).strip()
+            if stripped == candidate:
+                break
+            candidate = stripped
+        candidate = candidate.strip(" 　.。!！~～,，;；:：-—'\"“”")
+        if not candidate:
+            return None
+        # 过长、带 JSON 括号或键值对的，基本可以断定是日志片段。
+        if len(candidate) > MAX_TITLE_LENGTH:
+            return None
+        if TITLE_REJECT_RE.search(candidate):
+            return None
+        # 纯数字/纯标点不是标题。
+        if not re.search(r"[^\W\d_]", candidate, re.UNICODE):
+            return None
+        return candidate
 
     def __resolve_media_type(self, media: Dict[str, Any], record: Dict[str, Any]) -> Optional[MediaType]:
         """把日志里的类型标识转换为 MoviePilot 的 MediaType。"""
@@ -2003,11 +2395,38 @@ class MediaAutomatorSync(_PluginBase):
                 return datetime.strptime(text, fmt)
             except ValueError:
                 continue
-        # 形如 2025-01-01T10:00:00+08:00 的时间戳，剥离时区后返回本地朴素时间。
+        # 形如 2025-01-01T10:00:00+08:00 的时间戳：带时区时必须先换算到本地，
+        # 否则直接丢弃 tzinfo 会让 UTC 容器的日志看起来比本地时间早 8 小时。
         try:
-            return datetime.fromisoformat(text).replace(tzinfo=None)
+            parsed = datetime.fromisoformat(text)
         except ValueError:
             return None
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone().replace(tzinfo=None)
+        return parsed.replace(tzinfo=None)
+
+    @staticmethod
+    def __now_text() -> str:
+        """当前时间的标准写法，用作水位线。"""
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")
+
+    def __newest_timestamp(self, text: str) -> str:
+        """
+        从日志文本里找出最新的一条事件时间，用于建立初始水位线。
+
+        只扫尾部若干行：最新时间必然出现在末尾，没必要为了它解析整份文件。
+        """
+        if not text:
+            return ""
+        newest: Optional[datetime] = None
+        for raw in text.splitlines()[-200:]:
+            record = self.__parse_log_line(raw)
+            if not record:
+                continue
+            timestamp = self.__parse_timestamp(record.get("timestamp"))
+            if timestamp and (newest is None or timestamp > newest):
+                newest = timestamp
+        return newest.strftime("%Y-%m-%d %H:%M:%S,%f") if newest else ""
 
     @staticmethod
     def __title_after_keyword(message: str) -> Optional[str]:
@@ -2040,15 +2459,25 @@ class MediaAutomatorSync(_PluginBase):
         """把读取位置、远程行指纹与历史记录写入插件存储。"""
         self.save_data("cursor", self._cursor)
         self.save_data("http_state", self._http_state)
+        self.save_data("watermark", self._watermark)
         self.save_data("history", self._history[-self._history_limit:])
 
-    def __record_history(self, action: str, media: Dict[str, Any], message: str) -> None:
+    def __record_history(
+        self,
+        action: str,
+        media: Dict[str, Any],
+        message: str,
+        raw: str = "",
+    ) -> None:
         """
         追加一条处理历史并立即落盘。
 
         立即保存而不是攒到本轮结束：宿主在保存配置、更新插件时会重入
         ``init_plugin()``，那时会用插件存储里的内容覆盖内存状态；只在
         ``sync()`` 末尾保存会让这批历史丢失。
+
+        ``raw`` 保存触发这条历史的原始日志片段，便于事后核对到底是哪一行
+        让插件去订阅了某部片。
         """
         with self._state_lock:
             self._history.append(
@@ -2059,6 +2488,8 @@ class MediaAutomatorSync(_PluginBase):
                     "media_source": media.get("media_source"),
                     "media_id": media.get("media_id"),
                     "message": message,
+                    # 日志原文可能很长，只留足够定位的片段。
+                    "raw": (raw or "")[:400],
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
             )

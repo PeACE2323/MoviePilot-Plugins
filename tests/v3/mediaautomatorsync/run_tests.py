@@ -11,11 +11,33 @@ DSH 沙箱下无法向托管 Python 安装 pytest，因此这里实现一个极�
 
 import importlib.util
 import inspect
+import shutil
 import sys
+import tempfile
 import traceback
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+
+
+def _temp_root() -> Path:
+    """挑一个当前进程确实能写的临时根目录。
+
+    优先仓库内的 ``.tmp``，便于随仓库清理；但工作区权限继承异常的环境
+    （例如目录由别的会话创建，当前沙箱身份拿不到写入授权）会拒绝写入，
+    此时回退到系统临时目录，避免整套用例因为环境问题集体失败。
+    """
+    candidates = [HERE / ".tmp", Path(tempfile.gettempdir()) / "moviepilot-plugin-tests"]
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write-probe"
+            probe.write_text("x", encoding="utf-8")
+            probe.unlink()
+        except OSError:
+            continue
+        return candidate
+    raise RuntimeError(f"找不到可写的临时目录，已尝试：{candidates}")
 
 
 def _load_module():
@@ -50,16 +72,20 @@ def main() -> int:
                 # plugin fixture 在无 pytest 时是普通函数，这里直接调用。
                 kwargs["plugin"] = module.plugin()
             if "tmp_path" in params:
-                # 直接在工作区内建目录，不用 tempfile：沙箱下系统临时目录的
-                # cleanup 会因权限问题失败，而工作区内的目录是允许写入的。
-                # 每个用例固定复用自己的目录，避免残留目录越积越多。
-                base = HERE / ".tmp"
-                base.mkdir(exist_ok=True)
-                run_dir = base / f"case_{index}"
-                # 清空内容但保留目录本身，规避某些环境下删除目录被拒的问题。
+                # 每个用例固定复用自己的目录，避免残留目录越积越多；
+                # 目录本身保留不删，规避某些环境下删除目录被拒的问题。
+                run_dir = _temp_root() / f"case_{index}"
                 if run_dir.exists():
                     for child in run_dir.iterdir():
-                        child.unlink(missing_ok=True)
+                        try:
+                            if child.is_dir():
+                                shutil.rmtree(child, ignore_errors=True)
+                            else:
+                                child.unlink(missing_ok=True)
+                        except OSError:
+                            # 清理失败不影响用例：插件按绝对路径读写，
+                            # 残留文件不会串到下一个用例里。
+                            pass
                 run_dir.mkdir(parents=True, exist_ok=True)
                 kwargs["tmp_path"] = run_dir
             func(**kwargs)

@@ -1,15 +1,16 @@
 {
   "MediaAutomatorSync": {
     "name": "Media Automator 订阅同步",
-    "description": "读取 Media Automator 日志，自动同步订阅的新增与删除。支持远程 HTTP 或本地文件两种来源。",
+    "description": "读取 Media Automator 日志，自动同步订阅的新增与删除。支持远程 HTTP 或本地文件两种来源，并可按需清理本插件创建的多余订阅。",
     "labels": "订阅,同步",
-    "version": "1.4.0",
+    "version": "1.5.0",
     "icon": "MediaAutomator_A.png",
     "author": "PeACE2323",
     "project_url": "https://github.com/PeACE2323/MoviePilot-Plugins",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.5.0": "修复首次运行重放历史日志导致误订阅：首次只建立基线，并用时间水位线挡住陈旧事件、批内去重、拒收脏标题；新增「清理多余订阅」。",
       "v1.4.0": "新增「订阅时关闭洗版」开关，避免同步的订阅被洗版逻辑卡住而不下载。",
       "v1.3.1": "新增「订阅特别篇（季 0）」开关，默认开启；修复只有特别篇的剧被订成第 1 季。",
       "v1.3.0": "电视剧改为逐季订阅，多季剧不再只订第一季。",
